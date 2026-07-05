@@ -297,6 +297,7 @@ def test_inspector_previews_exported_tones(tmp_path, monkeypatch):
         ("Amp", "Amp_Clean", "Amps"),
         ("Cabinet", "Cab_212", "Cab_212"),
     ]
+    assert clean_gear[0].knob_values == {"Gain": 0.2, "Bass": 0.5}
 
 
 def test_inspector_previews_rig_builder_routes(tmp_path, monkeypatch):

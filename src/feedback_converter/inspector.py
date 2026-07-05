@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,10 @@ class ToneGearPreview:
     type: str
     category: str
     knobs: int
+    knob_values: dict[str, Any] = field(default_factory=dict)
+    recommendation_kind: str = ""
+    recommendation: str = ""
+    recommendation_detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -246,13 +251,128 @@ def _tone_definition_preview(definition: dict[str, Any]) -> ToneDefinitionPrevie
 
 def _tone_gear_preview(slot: str, gear: dict[str, Any]) -> ToneGearPreview:
     knobs = gear.get("KnobValues") if isinstance(gear.get("KnobValues"), dict) else {}
+    recommendation = _gear_recommendation(gear)
     return ToneGearPreview(
         slot=str(slot),
         key=str(gear.get("Key") or gear.get("PedalKey") or gear.get("Type") or ""),
         type=str(gear.get("Type") or ""),
         category=str(gear.get("Category") or ""),
         knobs=len(knobs),
+        knob_values={str(key): value for key, value in knobs.items()},
+        recommendation_kind=recommendation["kind"],
+        recommendation=recommendation["name"],
+        recommendation_detail=recommendation["detail"],
     )
+
+
+def _gear_recommendation(gear: dict[str, Any]) -> dict[str, str]:
+    key = str(gear.get("Key") or gear.get("PedalKey") or gear.get("Type") or "")
+    data_dir = _rig_builder_data_dir()
+    if not key or data_dir is None:
+        return {"kind": "", "name": "", "detail": ""}
+
+    cab = _cab_recommendation(data_dir, key)
+    if cab["name"]:
+        return cab
+
+    vst_map = _load_json_file(data_dir / "rs_gear_to_vst.json")
+    vst_candidates = vst_map.get(key) if isinstance(vst_map, dict) else None
+    if isinstance(vst_candidates, list) and vst_candidates:
+        primary = next((item for item in vst_candidates if isinstance(item, dict) and item.get("bundled")), None)
+        if primary is None:
+            primary = next((item for item in vst_candidates if isinstance(item, dict)), None)
+        if primary:
+            name = primary.get("name") or Path(str(primary.get("bundled") or "")).stem
+            asset = Path(str(primary.get("bundled") or "")).name
+            detail = asset or str(primary.get("notes") or "")
+            return {"kind": "VST", "name": str(name or ""), "detail": detail}
+
+    default_captures = _load_json_file(data_dir / "default_captures.json")
+    capture = default_captures.get(key) if isinstance(default_captures, dict) else None
+    if isinstance(capture, dict) and capture.get("tone3000_id"):
+        return {
+            "kind": str(capture.get("kind") or "NAM").upper(),
+            "name": f"tone3000 #{capture['tone3000_id']}",
+            "detail": f"model {capture.get('model_id')}" if capture.get("model_id") else "",
+        }
+
+    rs_map = _load_json_file(data_dir / "rs_to_real.json")
+    real = rs_map.get(key) if isinstance(rs_map, dict) else None
+    if isinstance(real, dict):
+        variant = _amp_variant(real, gear)
+        if variant:
+            return variant
+        name = " ".join(str(real.get(part) or "").strip() for part in ("make", "model")).strip()
+        return {
+            "kind": str(real.get("category") or "mapped").upper(),
+            "name": name or str(real.get("name") or key),
+            "detail": str(real.get("tone3000_query") or ""),
+        }
+
+    return {"kind": "", "name": "", "detail": ""}
+
+
+def _cab_recommendation(data_dir: Path, key: str) -> dict[str, str]:
+    mic_map = _load_json_file(data_dir / "rs_cab_mic_map.json")
+    if not isinstance(mic_map, dict):
+        return {"kind": "", "name": "", "detail": ""}
+    for base, variants in mic_map.items():
+        if not isinstance(variants, dict):
+            continue
+        for spec in variants.values():
+            if isinstance(spec, dict) and str(spec.get("effect_name") or "").lower() == key.lower():
+                return {
+                    "kind": "IR",
+                    "name": str(spec.get("ir_file") or ""),
+                    "detail": f"{base} · {spec.get('label') or spec.get('position') or ''}",
+                }
+    return {"kind": "", "name": "", "detail": ""}
+
+
+def _amp_variant(real: dict[str, Any], gear: dict[str, Any]) -> dict[str, str] | None:
+    variants = real.get("gain_variants")
+    knobs = gear.get("KnobValues") if isinstance(gear.get("KnobValues"), dict) else {}
+    gain = knobs.get("Gain")
+    if not isinstance(variants, dict) or gain is None:
+        return None
+    try:
+        gain_value = float(gain)
+    except (TypeError, ValueError):
+        return None
+    for level, spec in variants.items():
+        if not isinstance(spec, dict):
+            continue
+        lo_hi = spec.get("rs_gain_range") or []
+        if len(lo_hi) != 2:
+            continue
+        try:
+            lo, hi = float(lo_hi[0]), float(lo_hi[1])
+        except (TypeError, ValueError):
+            continue
+        if lo <= gain_value <= hi:
+            return {
+                "kind": "NAM",
+                "name": str(spec.get("notes") or f"tone3000 #{spec.get('tone3000_id')}"),
+                "detail": f"{level} · Gain {gain_value:g}",
+            }
+    return None
+
+
+def _load_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _rig_builder_data_dir() -> Path | None:
+    candidates = [
+        Path(r"C:\Program Files\feedback\current\resources\slopsmith\plugins\rig_builder\data"),
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 def _rig_builder_preview(input_psarc: Path) -> list[RigBuilderMappingPreview]:

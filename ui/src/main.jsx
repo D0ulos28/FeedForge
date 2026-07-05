@@ -491,6 +491,8 @@ function ToneInspector({ tones, rigBuilder }) {
                         <span>{gear.slot}</span>
                         <strong>{gear.key || gear.type || "Unknown gear"}</strong>
                         <small>{gear.category || gear.type || "mapped by key"} · {gear.knobs} knobs</small>
+                        <GearRecommendation gear={gear} />
+                        <KnobValues values={gear.knob_values} />
                       </div>
                     ))}
                   </div>
@@ -503,6 +505,38 @@ function ToneInspector({ tones, rigBuilder }) {
       ))}
     </section>
   );
+}
+
+function GearRecommendation({ gear }) {
+  if (!gear.recommendation && !gear.recommendation_kind) return null;
+  return (
+    <div className="gear-recommendation">
+      <b>{gear.recommendation_kind || "Mapped"}</b>
+      <span>{gear.recommendation || "No named target"}</span>
+      {gear.recommendation_detail && <small>{gear.recommendation_detail}</small>}
+    </div>
+  );
+}
+
+function KnobValues({ values }) {
+  const entries = Object.entries(values || {}).slice(0, 6);
+  if (!entries.length) return null;
+  return (
+    <div className="knob-values">
+      {entries.map(([key, value]) => (
+        <span key={key}>{shortKnob(key)} {formatKnob(value)}</span>
+      ))}
+    </div>
+  );
+}
+
+function shortKnob(value) {
+  return String(value).replace(/^[A-Za-z0-9]+_/, "");
+}
+
+function formatKnob(value) {
+  if (typeof value === "number") return Number.isInteger(value) ? String(value) : value.toFixed(2);
+  return String(value);
 }
 
 function RouteBadge({ mapping }) {

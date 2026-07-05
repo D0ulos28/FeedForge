@@ -681,6 +681,53 @@ button:disabled {
   white-space: nowrap;
 }
 
+.gear-recommendation {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 9px;
+  background: rgba(22, 169, 232, 0.09);
+  border: 1px solid rgba(22, 169, 232, 0.18);
+}
+
+.gear-recommendation b,
+.gear-recommendation span,
+.gear-recommendation small {
+  display: block;
+}
+
+.gear-recommendation b {
+  color: #9bdcff;
+  font-size: 11px;
+}
+
+.gear-recommendation span {
+  margin-top: 3px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.gear-recommendation small {
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.knob-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.knob-values span {
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: rgba(151, 174, 205, 0.1);
+  color: #c7d4e5;
+  font-size: 10px;
+}
+
 .route-badge {
   flex: 0 0 auto;
   padding: 5px 9px;

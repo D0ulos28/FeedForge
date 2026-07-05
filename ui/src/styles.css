@@ -457,6 +457,23 @@ button:disabled {
   font-size: 12px;
 }
 
+.inspector-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.inspector-tabs button {
+  justify-content: center;
+  min-height: 40px;
+}
+
+.inspector-tabs button.active {
+  border-color: #2388ba;
+  background: rgba(22, 169, 232, 0.16);
+  color: #dff6ff;
+}
+
 .readiness {
   list-style: none;
   padding: 14px 16px 16px;
@@ -492,6 +509,11 @@ button:disabled {
   color: var(--muted);
 }
 
+.muted-text {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .error-box {
   margin: 0 16px 16px;
   padding: 12px;
@@ -520,6 +542,116 @@ button:disabled {
 .arrangement span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.tone-panel {
+  max-height: 690px;
+  overflow: auto;
+}
+
+.tone-arrangement {
+  padding: 16px;
+  border-bottom: 1px solid rgba(151, 174, 205, 0.12);
+}
+
+.tone-arrangement:last-child {
+  border-bottom: 0;
+}
+
+.tone-arrangement-head,
+.tone-definition-head,
+.tone-change {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tone-arrangement-head span,
+.tone-definition-head code,
+.tone-arrangement-head code,
+.tone-change code {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.tone-arrangement-head span {
+  display: block;
+  margin-top: 4px;
+}
+
+.tone-section {
+  margin-top: 16px;
+}
+
+.tone-section h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: #8ea5c2;
+  text-transform: uppercase;
+}
+
+.tone-changes,
+.tone-definitions {
+  display: grid;
+  gap: 10px;
+}
+
+.tone-change {
+  padding: 9px 10px;
+  border-radius: 10px;
+  background: rgba(12, 21, 34, 0.84);
+  border: 1px solid rgba(151, 174, 205, 0.08);
+}
+
+.tone-change b {
+  color: #9bdcff;
+  min-width: 44px;
+}
+
+.tone-change span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tone-definition {
+  padding: 12px;
+  border-radius: 12px;
+  background: #0c1522;
+  border: 1px solid rgba(151, 174, 205, 0.1);
+}
+
+.gear-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.gear-chip {
+  min-width: 0;
+  padding: 9px;
+  border-radius: 10px;
+  background: rgba(22, 35, 55, 0.85);
+  border: 1px solid rgba(151, 174, 205, 0.08);
+}
+
+.gear-chip span,
+.gear-chip small {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.gear-chip strong {
+  display: block;
+  margin: 3px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .spin {

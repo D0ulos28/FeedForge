@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import yaml
 
 from feedback_converter import converter
+from feedback_converter import inspector
 
 
 def ns(**kwargs):
@@ -265,3 +266,33 @@ def test_convert_psarc_can_skip_tones(tmp_path, monkeypatch):
     assert "rigs" not in manifest
     assert "tones" not in arrangement
     assert not (output / "rigs.json").exists()
+
+
+def test_inspector_previews_exported_tones(tmp_path, monkeypatch):
+    class FakeSong:
+        @staticmethod
+        def parse(_data):
+            return fake_song()
+
+    monkeypatch.setattr(inspector, "PSARC", FakePSARC)
+    monkeypatch.setattr(inspector, "Song", FakeSong)
+
+    psarc = tmp_path / "input.psarc"
+    psarc.write_bytes(b"fake")
+
+    preview = inspector.inspect_psarc(psarc)
+
+    assert len(preview.tones) == 1
+    tone_arrangement = preview.tones[0]
+    assert tone_arrangement.base == "Clean"
+    assert tone_arrangement.base_rig == "tone-0-clean"
+    assert [tone.name for tone in tone_arrangement.definitions] == ["Clean", "Drive"]
+    assert [(change.time, change.name, change.rig) for change in tone_arrangement.changes] == [
+        (0.0, "Clean", "tone-0-clean"),
+        (5.0, "Drive", "tone-1-drive"),
+    ]
+    clean_gear = tone_arrangement.definitions[0].gear
+    assert [(gear.slot, gear.key, gear.type) for gear in clean_gear] == [
+        ("Amp", "Amp_Clean", "Amps"),
+        ("Cabinet", "Cab_212", "Cab_212"),
+    ]

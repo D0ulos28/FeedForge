@@ -354,9 +354,11 @@ function Queue({ items, selectedId, onSelect }) {
 }
 
 function Inspector({ item }) {
+  const [tab, setTab] = useState("overview");
   const preview = item?.preview;
   const cover = preview?.cover_path ? `file:///${preview.cover_path.replaceAll("\\", "/")}` : null;
   const arrangements = preview?.arrangements || [];
+  const tones = preview?.tones || [];
   return (
     <aside className="inspector">
       <section className="song-hero">
@@ -373,38 +375,118 @@ function Inspector({ item }) {
         </div>
       </section>
 
-      <section className="panel">
-        <div className="panel-title">
-          <h2>Readiness</h2>
-          <span>{item ? statusText(item.status) : "Waiting"}</span>
-        </div>
-        <ul className="readiness">
-          <ReadyLine ok={!!preview} text="Package metadata inspected" />
-          <ReadyLine ok={!!cover} text="Cover image detected" />
-          <ReadyLine ok={arrangements.length > 0} text={`${arrangements.length || 0} playable arrangement${arrangements.length === 1 ? "" : "s"}`} />
-          <ReadyLine ok={!!preview?.lyrics} text={preview?.lyrics ? `${preview.lyrics} lyric timing events` : "Lyrics optional"} muted={!preview?.lyrics} />
-        </ul>
-        {item?.error && <div className="error-box"><AlertTriangle size={17} /> {item.error}</div>}
-      </section>
+      <div className="inspector-tabs">
+        <button className={tab === "overview" ? "active" : ""} onClick={() => setTab("overview")}>Overview</button>
+        <button className={tab === "tones" ? "active" : ""} onClick={() => setTab("tones")}>Tones</button>
+      </div>
 
-      <section className="panel">
-        <div className="panel-title">
-          <h2>Arrangements</h2>
-          <Guitar size={18} />
-        </div>
-        <div className="arrangements">
-          {arrangements.length === 0 && <div className="empty compact">No arrangements inspected yet.</div>}
-          {arrangements.map((arrangement) => (
-            <div className="arrangement" key={arrangement.id}>
-              <strong>{arrangement.name}</strong>
-              <span>{arrangement.difficulties} levels</span>
-              <span>{arrangement.notes + arrangement.chords} events</span>
+      {tab === "overview" ? (
+        <>
+          <section className="panel">
+            <div className="panel-title">
+              <h2>Readiness</h2>
+              <span>{item ? statusText(item.status) : "Waiting"}</span>
             </div>
-          ))}
-        </div>
-      </section>
+            <ul className="readiness">
+              <ReadyLine ok={!!preview} text="Package metadata inspected" />
+              <ReadyLine ok={!!cover} text="Cover image detected" />
+              <ReadyLine ok={arrangements.length > 0} text={`${arrangements.length || 0} playable arrangement${arrangements.length === 1 ? "" : "s"}`} />
+              <ReadyLine ok={tones.length > 0} text={tones.length ? `${countToneDefinitions(tones)} tone definition${countToneDefinitions(tones) === 1 ? "" : "s"} detected` : "No tone definitions detected"} muted={!tones.length} />
+              <ReadyLine ok={!!preview?.lyrics} text={preview?.lyrics ? `${preview.lyrics} lyric timing events` : "Lyrics optional"} muted={!preview?.lyrics} />
+            </ul>
+            {item?.error && <div className="error-box"><AlertTriangle size={17} /> {item.error}</div>}
+          </section>
+
+          <section className="panel">
+            <div className="panel-title">
+              <h2>Arrangements</h2>
+              <Guitar size={18} />
+            </div>
+            <div className="arrangements">
+              {arrangements.length === 0 && <div className="empty compact">No arrangements inspected yet.</div>}
+              {arrangements.map((arrangement) => (
+                <div className="arrangement" key={arrangement.id}>
+                  <strong>{arrangement.name}</strong>
+                  <span>{arrangement.difficulties} levels</span>
+                  <span>{arrangement.notes + arrangement.chords} events</span>
+                </div>
+              ))}
+            </div>
+          </section>
+        </>
+      ) : (
+        <ToneInspector tones={tones} />
+      )}
     </aside>
   );
+}
+
+function ToneInspector({ tones }) {
+  return (
+    <section className="panel tone-panel">
+      <div className="panel-title">
+        <h2>Tone Export</h2>
+        <span>{countToneDefinitions(tones)} definitions</span>
+      </div>
+      {tones.length === 0 && (
+        <div className="empty compact">No PSARC tone data was detected for this song.</div>
+      )}
+      {tones.map((arrangement) => (
+        <div className="tone-arrangement" key={arrangement.arrangement_id}>
+          <div className="tone-arrangement-head">
+            <div>
+              <strong>{arrangement.arrangement_name}</strong>
+              <span>Base: {arrangement.base || "Not set"}</span>
+            </div>
+            <code>{arrangement.base_rig || "no-rig"}</code>
+          </div>
+
+          <div className="tone-section">
+            <h3>Timeline</h3>
+            <div className="tone-changes">
+              {(arrangement.changes || []).length === 0 && <span className="muted-text">No tone changes. Base tone is used for the whole song.</span>}
+              {(arrangement.changes || []).slice(0, 16).map((change, index) => (
+                <div className="tone-change" key={`${change.time}-${change.name}-${index}`}>
+                  <b>{duration(change.time)}</b>
+                  <span>{change.name}</span>
+                  <code>{change.rig}</code>
+                </div>
+              ))}
+              {(arrangement.changes || []).length > 16 && <span className="muted-text">Showing first 16 of {arrangement.changes.length} tone changes.</span>}
+            </div>
+          </div>
+
+          <div className="tone-section">
+            <h3>Definitions</h3>
+            <div className="tone-definitions">
+              {(arrangement.definitions || []).map((definition) => (
+                <div className="tone-definition" key={definition.key || definition.name}>
+                  <div className="tone-definition-head">
+                    <strong>{definition.name || "Unnamed tone"}</strong>
+                    <code>{definition.key || "no-key"}</code>
+                  </div>
+                  <div className="gear-list">
+                    {(definition.gear || []).length === 0 && <span className="muted-text">No gear chain found.</span>}
+                    {(definition.gear || []).map((gear) => (
+                      <div className="gear-chip" key={`${definition.key}-${gear.slot}-${gear.key}`}>
+                        <span>{gear.slot}</span>
+                        <strong>{gear.key || gear.type || "Unknown gear"}</strong>
+                        <small>{gear.category || gear.type || "mapped by key"} · {gear.knobs} knobs</small>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function countToneDefinitions(tones) {
+  return (tones || []).reduce((total, arrangement) => total + ((arrangement.definitions || []).length), 0);
 }
 
 function ReadyLine({ ok, text, muted = false }) {

@@ -12,6 +12,7 @@ from .converter import (
     _extract_metadata,
     _find_sng_entries,
     _highest_level,
+    _song_tones_to_feedpak,
 )
 from .psarc_format.psarc import PSARC
 from .psarc_format.sng import Song
@@ -27,6 +28,39 @@ class ArrangementPreview:
     difficulties: int
     notes: int
     chords: int
+
+
+@dataclass(frozen=True)
+class ToneGearPreview:
+    slot: str
+    key: str
+    type: str
+    category: str
+    knobs: int
+
+
+@dataclass(frozen=True)
+class ToneDefinitionPreview:
+    name: str
+    key: str
+    gear: list[ToneGearPreview] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ToneChangePreview:
+    time: float
+    name: str
+    rig: str
+
+
+@dataclass(frozen=True)
+class ArrangementTonePreview:
+    arrangement_id: str
+    arrangement_name: str
+    base: str
+    base_rig: str
+    definitions: list[ToneDefinitionPreview] = field(default_factory=list)
+    changes: list[ToneChangePreview] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -46,6 +80,7 @@ class PsarcPreview:
     duration: float | None = None
     cover_path: Path | None = None
     arrangements: list[ArrangementPreview] = field(default_factory=list)
+    tones: list[ArrangementTonePreview] = field(default_factory=list)
     chart_points: list[ChartPoint] = field(default_factory=list)
     lyrics: int = 0
     warnings: list[str] = field(default_factory=list)
@@ -63,6 +98,7 @@ def inspect_psarc(input_psarc: Path, *, cover_dir: Path | None = None) -> PsarcP
 
     metadata = _extract_metadata(content)
     arrangements: list[ArrangementPreview] = []
+    tones: list[ArrangementTonePreview] = []
     chart_points: list[ChartPoint] = []
     lyric_count = 0
     first_song: Any | None = None
@@ -106,6 +142,9 @@ def inspect_psarc(input_psarc: Path, *, cover_dir: Path | None = None) -> PsarcP
                 chords=chord_count,
             )
         )
+        tone_preview = _tone_preview(song, source_path, arr_id, _display_name(arr_id), metadata)
+        if tone_preview is not None:
+            tones.append(tone_preview)
 
     cover_path = _extract_cover(content, cover_dir)
     duration = metadata.get("duration") or _duration_from_song(first_song)
@@ -125,9 +164,71 @@ def inspect_psarc(input_psarc: Path, *, cover_dir: Path | None = None) -> PsarcP
         duration=float(duration) if duration else None,
         cover_path=cover_path,
         arrangements=arrangements,
+        tones=tones,
         chart_points=chart_points,
         lyrics=lyric_count,
         warnings=warnings,
+    )
+
+
+def _tone_preview(
+    song: Any,
+    source_path: str,
+    arrangement_id: str,
+    arrangement_name: str,
+    metadata: dict[str, Any],
+) -> ArrangementTonePreview | None:
+    converted = _song_tones_to_feedpak(song, source_path, metadata)
+    if not converted:
+        return None
+
+    tone_data = converted.get("tones") or {}
+    definitions = [
+        _tone_definition_preview(definition)
+        for definition in tone_data.get("definitions") or []
+        if isinstance(definition, dict)
+    ]
+    changes = [
+        ToneChangePreview(
+            time=float(change.get("t") or 0.0),
+            name=str(change.get("name") or ""),
+            rig=str(change.get("rig") or ""),
+        )
+        for change in tone_data.get("changes") or []
+        if isinstance(change, dict)
+    ]
+    return ArrangementTonePreview(
+        arrangement_id=arrangement_id,
+        arrangement_name=arrangement_name,
+        base=str(tone_data.get("base") or ""),
+        base_rig=str(tone_data.get("base_rig") or ""),
+        definitions=definitions,
+        changes=changes,
+    )
+
+
+def _tone_definition_preview(definition: dict[str, Any]) -> ToneDefinitionPreview:
+    gear_list = definition.get("GearList") if isinstance(definition.get("GearList"), dict) else {}
+    gear = [
+        _tone_gear_preview(slot, item)
+        for slot, item in gear_list.items()
+        if isinstance(item, dict)
+    ]
+    return ToneDefinitionPreview(
+        name=str(definition.get("Name") or definition.get("ToneName") or definition.get("name") or ""),
+        key=str(definition.get("Key") or definition.get("ToneKey") or definition.get("key") or ""),
+        gear=gear,
+    )
+
+
+def _tone_gear_preview(slot: str, gear: dict[str, Any]) -> ToneGearPreview:
+    knobs = gear.get("KnobValues") if isinstance(gear.get("KnobValues"), dict) else {}
+    return ToneGearPreview(
+        slot=str(slot),
+        key=str(gear.get("Key") or gear.get("PedalKey") or gear.get("Type") or ""),
+        type=str(gear.get("Type") or ""),
+        category=str(gear.get("Category") or ""),
+        knobs=len(knobs),
     )
 
 

@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,10 +14,33 @@ from feedback_converter import converter
 from feedback_converter import inspector
 from feedback_converter import rig_builder_seed
 from feedback_converter.cli import _single_output_path
+from feedback_converter.psarc_format import crypto
+from feedback_converter.psarc_format.psarc import read_entry
 
 
 def ns(**kwargs):
     return SimpleNamespace(**kwargs)
+
+
+def test_psarc_read_entry_bounds_zero_block_to_entry_end():
+    bom = ns(entries=[ns(offset=0, zindex=0, length=6)], zlength=[0])
+
+    assert read_entry(BytesIO(b"abcdefNEXT"), 0, bom, end_offset=6) == b"abcdef"
+
+
+def test_decrypt_psarc_matches_windows_style_sng_paths(monkeypatch):
+    calls = []
+
+    def fake_decrypt(data, key):
+        calls.append((data, key))
+        return b"decrypted"
+
+    monkeypatch.setattr(crypto, "decrypt_sng", fake_decrypt)
+
+    result = crypto.decrypt_psarc({"songs\\bin\\generic\\song_lead.sng": b"encrypted"})
+
+    assert result["songs\\bin\\generic\\song_lead.sng"] == b"decrypted"
+    assert calls == [(b"encrypted", crypto.WIN_KEY)]
 
 
 class FakePSARC:

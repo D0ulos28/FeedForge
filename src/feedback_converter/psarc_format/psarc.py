@@ -57,7 +57,7 @@ HEADER = Struct(
 )
 
 
-def read_entry(stream, n, bom):
+def read_entry(stream, n, bom, end_offset=None):
     entry = bom.entries[n]
     stream.seek(entry.offset)
     zlength = bom.zlength[entry.zindex :]
@@ -68,7 +68,10 @@ def read_entry(stream, n, bom):
         if length == entry.length:
             break
 
-        chunk = stream.read(BLOCK_SIZE if z == 0 else z)
+        read_size = BLOCK_SIZE if z == 0 else z
+        if end_offset is not None:
+            read_size = min(read_size, max(0, end_offset - stream.tell()))
+        chunk = stream.read(read_size)
         try:
             chunk = zlib.decompress(chunk)
         except zlib.error:
@@ -127,8 +130,12 @@ class PSARC(Construct):
 
     def _parse(self, stream, context, path):
         header = HEADER.parse_stream(stream)
+        stream.seek(0, 2)
+        file_size = stream.tell()
+        offsets = [entry.offset for entry in header.bom.entries]
+        end_offsets = offsets[1:] + [file_size]
         listing, *entries = [
-            read_entry(stream, i, header.bom) for i in range(header.n_entries)
+            read_entry(stream, i, header.bom, end_offsets[i]) for i in range(header.n_entries)
         ]
         listing = listing.decode().splitlines()
         content = dict(zip(listing, entries))

@@ -69,9 +69,10 @@ def decrypt_psarc(content):
     # TODO: profile, config
     content = content.copy()
     for k in content:
-        if "songs/bin/macos/" in k:
+        normalized = k.replace("\\", "/").lower()
+        if "songs/bin/macos/" in normalized:
             content[k] = decrypt_sng(content[k], MAC_KEY)
-        elif "songs/bin/generic/" in k:
+        elif "songs/bin/generic/" in normalized:
             content[k] = decrypt_sng(content[k], WIN_KEY)
     return content
 
@@ -80,8 +81,9 @@ def encrypt_psarc(content):
     # TODO: profile, config
     content = content.copy()
     for k in content:
-        if "songs/bin/macos/" in k:
+        normalized = k.replace("\\", "/").lower()
+        if "songs/bin/macos/" in normalized:
             content[k] = encrypt_sng(content[k], MAC_KEY)
-        elif "songs/bin/generic/" in k:
+        elif "songs/bin/generic/" in normalized:
             content[k] = encrypt_sng(content[k], WIN_KEY)
     return content

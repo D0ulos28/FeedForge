@@ -144,6 +144,8 @@ def seed_rig_builder_routes(input_psarc: Path, *, force: bool = True) -> SeedRes
                 if not force and _has_mapping(conn, song_key, tone_key):
                     continue
                 seeded.append(_seed_definition(conn, data_dir, song_key, tone_key, definition))
+        if any(tone.missing for tone in seeded):
+            _enable_feedback_tone3000_fallback()
         conn.commit()
         return SeedResult(db_path=db_path, song_key=song_key, tones=seeded)
     finally:
@@ -157,7 +159,17 @@ def _seed_definition(
     tone_key: str,
     definition: dict[str, Any],
 ) -> SeededTone:
+    missing: list[str] = []
+    stages = _stages_from_definition(data_dir, definition, missing)
     _delete_mapping(conn, song_key, tone_key)
+    if not stages:
+        return SeededTone(
+            tone_key=tone_key,
+            status="skipped",
+            stages=0,
+            missing=[],
+        )
+
     preset_name = f"{song_key}::{tone_key}"
     conn.execute(
         "INSERT INTO presets (name, model_file, ir_file, input_gain, output_gain, gate_threshold, settings_json) "
@@ -166,11 +178,10 @@ def _seed_definition(
     )
     preset_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
-    missing: list[str] = []
     model_file = ""
     ir_file = ""
     stage_count = 0
-    for slot_order, stage in enumerate(_stages_from_definition(data_dir, definition, missing)):
+    for slot_order, stage in enumerate(stages):
         conn.execute(
             "INSERT INTO preset_pieces "
             "(preset_id, slot_order, slot, rs_gear_type, kind, file, params_json, tone3000_id, "
@@ -206,7 +217,7 @@ def _seed_definition(
     )
     return SeededTone(
         tone_key=tone_key,
-        status="ready" if not missing and stage_count else "partial",
+        status="partial" if missing else "ready",
         stages=stage_count,
         missing=missing,
     )
@@ -230,12 +241,27 @@ def _stages_from_definition(
         stage = _resolve_stage(data_dir, slot_type, key, params)
         if stage is None:
             missing.append(key)
-            continue
+            stage = {
+                "slot": slot_type,
+                "gear": key,
+                "kind": "none",
+                "file": None,
+                "params": params,
+                "tone3000_id": None,
+                "vst_path": None,
+                "vst_format": None,
+                "vst_state": None,
+            }
         stages.append(stage)
     return stages
 
 
 def _resolve_stage(data_dir: Path, slot: str, gear_key: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    if slot == "amp":
+        capture = _resolve_tone3000_capture(data_dir, slot, gear_key, params)
+        if capture:
+            return capture
+
     vst = _resolve_vst(data_dir, gear_key)
     if vst:
         vst_state = _build_vst_state(data_dir, gear_key, vst, params)
@@ -262,7 +288,61 @@ def _resolve_stage(data_dir: Path, slot: str, gear_key: str, params: dict[str, A
                 "vst_format": None,
                 "vst_state": None,
             }
+    capture = _resolve_tone3000_capture(data_dir, slot, gear_key, params)
+    if capture:
+        return capture
     return None
+
+
+def _resolve_tone3000_capture(data_dir: Path, slot: str, gear_key: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    spec = _tone3000_spec_from_real_map(data_dir, gear_key, params) or _tone3000_spec_from_defaults(data_dir, gear_key)
+    if not spec:
+        return None
+    tone_id = _int_or_none(spec.get("tone3000_id"))
+    if tone_id is None:
+        return None
+    return {
+        "slot": slot,
+        "gear": gear_key,
+        "kind": str(spec.get("kind") or "nam"),
+        "file": None,
+        "params": params,
+        "tone3000_id": tone_id,
+        "vst_path": None,
+        "vst_format": None,
+        "vst_state": None,
+    }
+
+
+def _tone3000_spec_from_real_map(data_dir: Path, gear_key: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    real_map = _load_json_file(data_dir / "rs_to_real.json")
+    real = real_map.get(gear_key) if isinstance(real_map, dict) else None
+    if not isinstance(real, dict):
+        return None
+    variants = real.get("gain_variants")
+    if isinstance(variants, dict):
+        gain = _float_or_none(params.get("Gain"))
+        if gain is None:
+            gain = 50.0
+        for spec in variants.values():
+            if not isinstance(spec, dict):
+                continue
+            lo_hi = spec.get("rs_gain_range") or []
+            if len(lo_hi) != 2:
+                continue
+            lo = _float_or_none(lo_hi[0])
+            hi = _float_or_none(lo_hi[1])
+            if lo is not None and hi is not None and lo <= gain <= hi:
+                return {**spec, "kind": "nam"}
+    if real.get("tone3000_id"):
+        return {**real, "kind": "nam"}
+    return None
+
+
+def _tone3000_spec_from_defaults(data_dir: Path, gear_key: str) -> dict[str, Any] | None:
+    defaults = _load_json_file(data_dir / "default_captures.json")
+    spec = defaults.get(gear_key) if isinstance(defaults, dict) else None
+    return spec if isinstance(spec, dict) else None
 
 
 def _resolve_vst(data_dir: Path, gear_key: str) -> Path | None:
@@ -411,6 +491,21 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def _float_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _range_stem(stem: str) -> str:
     return STEM_RANGE_ALIASES.get(stem, stem)
 
@@ -528,6 +623,28 @@ def _rig_builder_config_dir() -> Path | None:
         return db.parent
     candidate = _default_rig_builder_db_path()
     return candidate.parent if candidate else None
+
+
+def _enable_feedback_tone3000_fallback() -> None:
+    config_dir = _rig_builder_config_dir()
+    if config_dir is None:
+        return
+    settings_path = config_dir / "rig_builder_settings.json"
+    settings: dict[str, Any] = {}
+    if settings_path.exists():
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                settings = loaded
+        except (OSError, json.JSONDecodeError):
+            return
+    if settings.get("curated_only") is False:
+        return
+    settings["curated_only"] = False
+    try:
+        settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError:
+        return
 
 
 def _default_rig_builder_db_path() -> Path | None:

@@ -140,10 +140,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--output must be a folder when converting multiple inputs")
 
     if len(input_paths) == 1:
+        output_path = _single_output_path(input_paths[0], output_arg)
         try:
             result = convert_psarc(
                 input_paths[0],
-                output_arg,
+                output_path,
                 archive=not args.directory,
                 overwrite=args.overwrite,
                 keep_workdir=args.keep_workdir,
@@ -151,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                 b_standard_to_7_string=args.b_standard_to_7_string,
             )
         except Exception as exc:  # noqa: BLE001
-            _cleanup_failed_workdir(input_paths[0], output_arg, archive=not args.directory)
+            _cleanup_failed_workdir(input_paths[0], output_path, archive=not args.directory)
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
@@ -177,6 +178,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"error converting {item.input_path}: {item.error}", file=sys.stderr)
     return 0 if batch.ok else 1
+
+
+def _single_output_path(input_path: Path, output_arg: Path | None) -> Path | None:
+    if output_arg is None:
+        return None
+    if output_arg.exists() and output_arg.is_dir():
+        return output_arg / input_path.with_suffix(".feedpak").name
+    if not output_arg.suffix:
+        return output_arg / input_path.with_suffix(".feedpak").name
+    return output_arg
 
 
 if __name__ == "__main__":

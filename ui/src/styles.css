@@ -87,6 +87,8 @@ select {
 
 .topbar,
 .toolbar,
+.filter-bar,
+.control-strip,
 .stats,
 .content-grid {
   max-width: 1460px;
@@ -158,6 +160,17 @@ button.danger:hover {
   background: rgba(255, 91, 110, 0.22);
 }
 
+button.ghost {
+  background: transparent;
+  border-color: rgba(151, 174, 205, 0.2);
+  color: var(--muted);
+}
+
+button.ghost:hover {
+  color: var(--text);
+  border-color: #314865;
+}
+
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
@@ -175,6 +188,14 @@ button:disabled {
   margin-top: 22px;
   display: flex;
   align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.filter-bar {
+  margin-top: 12px;
+  display: flex;
+  align-items: flex-end;
   gap: 10px;
   flex-wrap: wrap;
 }
@@ -274,6 +295,88 @@ button:disabled {
 .filter-pills button.active {
   background: #21334c;
   color: var(--text);
+}
+
+.filter-select {
+  min-width: 155px;
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.filter-select select {
+  height: 38px;
+  min-width: 155px;
+  border-radius: 10px;
+  border: 1px solid #283c57;
+  background: #0d1725;
+  color: var(--text);
+  padding: 0 10px;
+  outline: 0;
+  text-transform: none;
+}
+
+.control-strip {
+  margin-top: 10px;
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px;
+  border: 1px solid rgba(151, 174, 205, 0.14);
+  border-radius: 14px;
+  background: rgba(13, 23, 37, 0.66);
+}
+
+.control-actions,
+.settings-controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.path-action {
+  min-width: 150px;
+  max-width: 230px;
+  height: 40px;
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 0 11px;
+  background: rgba(7, 13, 21, 0.56);
+}
+
+.path-action span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.path-action b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.settings-controls {
+  padding: 2px 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.compact-controls .toggle,
+.compact-controls .select-control {
+  min-height: 38px;
+  padding-top: 6px;
+  padding-bottom: 6px;
 }
 
 .stats {
@@ -975,6 +1078,21 @@ button:disabled {
 @media (max-width: 1180px) {
   .content-grid {
     grid-template-columns: 1fr;
+  }
+
+  .control-strip {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .control-actions,
+  .settings-controls {
+    justify-content: flex-start;
+  }
+
+  .path-action {
+    flex: 1 1 220px;
+    max-width: none;
   }
 }
 

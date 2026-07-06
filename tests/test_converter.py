@@ -12,6 +12,7 @@ import yaml
 from feedback_converter import converter
 from feedback_converter import inspector
 from feedback_converter import rig_builder_seed
+from feedback_converter.cli import _single_output_path
 
 
 def ns(**kwargs):
@@ -238,6 +239,28 @@ def test_convert_psarc_writes_valid_feedpak_directory(tmp_path, monkeypatch):
         {"t": 3.0, "s": 2, "f": 8, "sus": 0.25, "sl": 7, "ln": True},
     ]
     assert len(arrangement["chords"]) == 1
+
+
+def test_single_cli_output_folder_resolves_inside_existing_folder(tmp_path):
+    input_path = tmp_path / "Song.psarc"
+    output_dir = tmp_path / "converted"
+    output_dir.mkdir()
+
+    assert _single_output_path(input_path, output_dir) == output_dir / "Song.feedpak"
+
+
+def test_single_cli_output_folder_resolves_inside_new_folder(tmp_path):
+    input_path = tmp_path / "Song.psarc"
+    output_dir = tmp_path / "converted"
+
+    assert _single_output_path(input_path, output_dir) == output_dir / "Song.feedpak"
+
+
+def test_single_cli_explicit_output_file_is_preserved(tmp_path):
+    input_path = tmp_path / "Song.psarc"
+    output_file = tmp_path / "custom.feedpak"
+
+    assert _single_output_path(input_path, output_file) == output_file
 
     validator = Path("references/feedpak-spec/tools/validate.py")
     if not validator.is_file():
@@ -503,6 +526,94 @@ def test_seed_rig_builder_routes_writes_playable_rows(tmp_path, monkeypatch):
     assert rows[0][6].endswith("Amp.vst3")
     assert rows[0][7] is not None
     assert rows[1][2:6] == ("cabinet", "Cab_212", "ir", "other/greenback 212 1 mono.wav")
+
+
+def test_seed_rig_builder_routes_uses_tone3000_capture_ids(tmp_path, monkeypatch):
+    class FakeSong:
+        @staticmethod
+        def parse(_data):
+            return fake_song()
+
+    db_dir = tmp_path / "feedback-desktop" / "slopsmith-config"
+    db_dir.mkdir(parents=True)
+    (db_dir / "nam_irs" / "other").mkdir(parents=True)
+    (db_dir / "nam_irs" / "other" / "greenback 212 1 mono.wav").write_bytes(b"ir")
+    db_path = db_dir / "nam_tone.db"
+
+    data_dir = tmp_path / "rig_builder" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "default_captures.json").write_text(
+        json.dumps({"Amp_Clean": {"kind": "nam", "model_id": 123, "tone3000_id": 456}}),
+        encoding="utf-8",
+    )
+    (data_dir / "rs_gear_to_vst.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_cab_mic_map.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_knob_to_vst_param.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(rig_builder_seed, "PSARC", FakePSARC)
+    monkeypatch.setattr(rig_builder_seed, "Song", FakeSong)
+    monkeypatch.setattr(rig_builder_seed, "_rig_builder_data_dir", lambda: data_dir)
+
+    psarc = tmp_path / "input.psarc"
+    psarc.write_bytes(b"fake")
+
+    result = rig_builder_seed.seed_rig_builder_routes(psarc)
+
+    assert any(tone.tone_key == "Tone_0" and tone.status == "ready" for tone in result.tones)
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT kind, file, tone3000_id, assigned_mode FROM preset_pieces WHERE rs_gear_type = 'Amp_Clean'"
+    ).fetchone()
+    conn.close()
+
+    assert row == ("nam", None, 456, "feedforge")
+
+
+def test_seed_rig_builder_routes_marks_unmapped_gear_pending_for_feedback_fallback(tmp_path, monkeypatch):
+    class FakeSong:
+        @staticmethod
+        def parse(_data):
+            return fake_song()
+
+    db_dir = tmp_path / "feedback-desktop" / "slopsmith-config"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "nam_tone.db"
+
+    data_dir = tmp_path / "rig_builder" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "default_captures.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_to_real.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_gear_to_vst.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_cab_mic_map.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_knob_to_vst_param.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(rig_builder_seed, "PSARC", FakePSARC)
+    monkeypatch.setattr(rig_builder_seed, "Song", FakeSong)
+    monkeypatch.setattr(rig_builder_seed, "_rig_builder_data_dir", lambda: data_dir)
+
+    psarc = tmp_path / "input.psarc"
+    psarc.write_bytes(b"fake")
+
+    result = rig_builder_seed.seed_rig_builder_routes(psarc)
+
+    pending = [tone for tone in result.tones if tone.tone_key == "Tone_0"]
+    assert pending and pending[0].status == "partial"
+    assert "Amp_Clean" in pending[0].missing
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT pp.slot, pp.rs_gear_type, pp.kind, pp.file, pp.tone3000_id "
+        "FROM tone_mappings tm JOIN preset_pieces pp ON pp.preset_id = tm.preset_id "
+        "WHERE tm.filename = 'input.feedpak' AND tm.tone_key = 'Tone_0' "
+        "ORDER BY pp.slot_order"
+    ).fetchall()
+    conn.close()
+
+    assert rows[0] == ("amp", "Amp_Clean", "none", None, None)
+    assert rows[1] == ("cabinet", "Cab_212", "none", None, None)
+    settings = json.loads((db_dir / "rig_builder_settings.json").read_text(encoding="utf-8"))
+    assert settings["curated_only"] is False
 
 
 def test_rig_builder_data_dir_accepts_portable_root(tmp_path, monkeypatch):

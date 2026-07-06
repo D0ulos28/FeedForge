@@ -42,6 +42,9 @@ function App() {
   const [conversionWorkers, setConversionWorkers] = useState(DEFAULT_CONVERSION_WORKERS);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
+  const [artistFilter, setArtistFilter] = useState("all");
+  const [albumFilter, setAlbumFilter] = useState("all");
+  const [tuningFilter, setTuningFilter] = useState("all");
   const [isConverting, setIsConverting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const itemsRef = useRef(items);
@@ -67,15 +70,37 @@ function App() {
   }, []);
 
   const selected = items.find((item) => item.id === selectedId) || items[0] || null;
+  const filterOptions = useMemo(() => {
+    const artists = new Set();
+    const albums = new Set();
+    const tunings = new Set();
+    for (const item of items) {
+      if (item.preview?.artist) artists.add(item.preview.artist);
+      if (item.preview?.album) albums.add(item.preview.album);
+      for (const label of arrangementTuningLabels(item.preview?.arrangements || [])) {
+        tunings.add(label);
+      }
+    }
+    return {
+      artists: sortedOptions(artists),
+      albums: sortedOptions(albums),
+      tunings: sortedOptions(tunings)
+    };
+  }, [items]);
+
   const filtered = items.filter((item) => {
-    const haystack = `${item.preview?.title || item.name} ${item.preview?.artist || ""}`.toLowerCase();
+    const haystack = `${item.preview?.title || item.name} ${item.preview?.artist || ""} ${item.preview?.album || ""}`.toLowerCase();
     const matchesQuery = haystack.includes(query.toLowerCase());
     const matchesFilter =
       filter === "all" ||
       (filter === "ready" && ["ready", "converted"].includes(item.status)) ||
       (filter === "issues" && ["failed", "needs-review"].includes(item.status)) ||
       (filter === "converted" && item.status === "converted");
-    return matchesQuery && matchesFilter;
+    const matchesArtist = artistFilter === "all" || item.preview?.artist === artistFilter;
+    const matchesAlbum = albumFilter === "all" || item.preview?.album === albumFilter;
+    const itemTunings = arrangementTuningLabels(item.preview?.arrangements || []);
+    const matchesTuning = tuningFilter === "all" || itemTunings.includes(tuningFilter);
+    return matchesQuery && matchesFilter && matchesArtist && matchesAlbum && matchesTuning;
   });
 
   const stats = useMemo(() => ({
@@ -284,33 +309,62 @@ function App() {
         <section className="toolbar">
           <div className="search">
             <Search size={17} />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search imported songs" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search title, artist, or album" />
           </div>
           <button onClick={chooseFiles}><Plus size={17} /> Add PSARCs</button>
           <button onClick={chooseFolder}><FolderOpen size={17} /> Add folder</button>
-          <button onClick={chooseOutput}><FolderOpen size={17} /> Output</button>
-          <button onClick={chooseRigBuilderData} title={rigBuilderDataDir || "Set FeedBack Rig Builder data folder"}>
-            <FolderOpen size={17} /> Rig Builder data
-          </button>
-          <label className="select-control">
-            Workers
-            <select value={conversionWorkers} onChange={(event) => setConversionWorkers(Number(event.target.value))} disabled={isConverting}>
-              {[1, 2, 3, 4, 5, 6].map((value) => <option key={value} value={value}>{value}</option>)}
-            </select>
-          </label>
-          <div className="filter-pills">
+        </section>
+
+        <section className="filter-bar">
+          <div className="filter-pills" aria-label="Queue status">
             <button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>All</button>
             <button className={filter === "ready" ? "active" : ""} onClick={() => setFilter("ready")}>Ready</button>
             <button className={filter === "issues" ? "active" : ""} onClick={() => setFilter("issues")}>Issues</button>
             <button className={filter === "converted" ? "active" : ""} onClick={() => setFilter("converted")}>Converted</button>
           </div>
-          <label className="toggle"><input type="checkbox" checked={overwrite} onChange={(event) => setOverwrite(event.target.checked)} /> Overwrite</label>
-          <label className="toggle"><input type="checkbox" checked={includeTones} onChange={(event) => setIncludeTones(event.target.checked)} disabled={isConverting} /> Include tones</label>
-          <label className="toggle lab-toggle">
-            <input type="checkbox" checked={bStandardTo7String} onChange={(event) => setBStandardTo7String(event.target.checked)} disabled={isConverting} />
-            B standard to 7-string
-          </label>
-          {rigBuilderDataDir && <span className="path-chip" title={rigBuilderDataDir}>Rig data: {basename(rigBuilderDataDir)}</span>}
+          <FilterSelect label="Artist" value={artistFilter} onChange={setArtistFilter} options={filterOptions.artists} />
+          <FilterSelect label="Album" value={albumFilter} onChange={setAlbumFilter} options={filterOptions.albums} />
+          <FilterSelect label="Tuning" value={tuningFilter} onChange={setTuningFilter} options={filterOptions.tunings} />
+          {(artistFilter !== "all" || albumFilter !== "all" || tuningFilter !== "all" || filter !== "all" || query) && (
+            <button className="ghost" onClick={() => {
+              setQuery("");
+              setFilter("all");
+              setArtistFilter("all");
+              setAlbumFilter("all");
+              setTuningFilter("all");
+            }}>
+              Clear filters
+            </button>
+          )}
+        </section>
+
+        <section className="control-strip">
+          <div className="control-actions">
+            <button className="path-action" onClick={chooseOutput} title={outputDir || "Use source folders for output"}>
+              <FolderOpen size={17} />
+              <span>Output</span>
+              <b>{outputDir ? basename(outputDir) : "Source folder"}</b>
+            </button>
+            <button className="path-action" onClick={chooseRigBuilderData} title={rigBuilderDataDir || "Auto-detect FeedBack Rig Builder data"}>
+              <FolderOpen size={17} />
+              <span>Rig data</span>
+              <b>{rigBuilderDataDir ? basename(rigBuilderDataDir) : "Auto"}</b>
+            </button>
+          </div>
+          <div className="settings-controls compact-controls">
+            <label className="select-control">
+              Workers
+              <select value={conversionWorkers} onChange={(event) => setConversionWorkers(Number(event.target.value))} disabled={isConverting}>
+                {[1, 2, 3, 4, 5, 6].map((value) => <option key={value} value={value}>{value}</option>)}
+              </select>
+            </label>
+            <label className="toggle"><input type="checkbox" checked={overwrite} onChange={(event) => setOverwrite(event.target.checked)} /> Overwrite</label>
+            <label className="toggle"><input type="checkbox" checked={includeTones} onChange={(event) => setIncludeTones(event.target.checked)} disabled={isConverting} /> Include tones</label>
+            <label className="toggle lab-toggle">
+              <input type="checkbox" checked={bStandardTo7String} onChange={(event) => setBStandardTo7String(event.target.checked)} disabled={isConverting} />
+              B standard to 7-string
+            </label>
+          </div>
         </section>
 
         <section className="stats">
@@ -338,6 +392,18 @@ function Metric({ label, value, tone = "" }) {
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+function FilterSelect({ label, value, onChange, options }) {
+  return (
+    <label className="filter-select">
+      {label}
+      <select value={value} onChange={(event) => onChange(event.target.value)} disabled={!options.length}>
+        <option value="all">All</option>
+        {options.map((option) => <option key={option} value={option}>{option}</option>)}
+      </select>
+    </label>
   );
 }
 
@@ -630,7 +696,7 @@ function RigBuilderRoute({ mapping }) {
     return (
       <div className="rig-route missing">
         <strong>FeedBack audio route</strong>
-        <span>Not seeded in local Rig Builder yet. FeedBack may fall back to a default rig or produce no processed tone for this section.</span>
+        <span>No local route has been written for this tone yet. Convert with Include tones enabled to seed it for FeedBack.</span>
       </div>
     );
   }
@@ -691,6 +757,32 @@ function statusText(status) {
     converted: "Converted",
     failed: "Failed"
   }[status] || "Waiting";
+}
+
+function sortedOptions(values) {
+  return Array.from(values)
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: "base" }));
+}
+
+function arrangementTuningLabels(arrangements) {
+  const labels = new Set();
+  for (const arrangement of arrangements || []) {
+    labels.add(tuningLabel(arrangement?.tuning));
+  }
+  return Array.from(labels).filter(Boolean);
+}
+
+function tuningLabel(tuning) {
+  if (!Array.isArray(tuning) || tuning.length === 0) return "";
+  if (tuning.every((value) => Number(value) === 0)) {
+    return tuning.length === 7 ? "7-string standard" : "E standard";
+  }
+  if (tuning.length === 6 && tuning.every((value) => Number(value) === -5)) return "B standard";
+  if (tuning.length === 6 && tuning.join(",") === "-2,0,0,0,0,0") return "Drop D";
+  if (tuning.length === 6 && tuning.join(",") === "-3,-1,-1,-1,-1,-1") return "C# standard";
+  if (tuning.length === 6 && tuning.join(",") === "-4,-2,-2,-2,-2,-2") return "C standard";
+  return tuning.map((value) => Number(value) > 0 ? `+${value}` : String(value)).join(" ");
 }
 
 function basename(filePath) {

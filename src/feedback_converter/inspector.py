@@ -412,7 +412,7 @@ def _rig_builder_preview(input_psarc: Path) -> list[RigBuilderMappingPreview]:
         mappings: list[RigBuilderMappingPreview] = []
         for row in rows:
             stages = [_rig_builder_stage_preview(stage) for stage in conn.execute(
-                "SELECT slot, rs_gear_type, kind, file, assigned_mode, bypassed, vst_path, vst_state "
+                "SELECT slot, rs_gear_type, kind, file, tone3000_id, assigned_mode, bypassed, vst_path, vst_state "
                 "FROM preset_pieces WHERE preset_id = ? ORDER BY slot_order",
                 (row["preset_id"],),
             )]
@@ -440,9 +440,12 @@ def _rig_builder_preview(input_psarc: Path) -> list[RigBuilderMappingPreview]:
 def _rig_builder_stage_preview(row: sqlite3.Row) -> RigBuilderStagePreview:
     kind = str(row["kind"] or "none")
     file_asset = str(row["file"] or "")
+    tone3000_id = row["tone3000_id"]
     vst_path = str(row["vst_path"] or "")
     vst_state = str(row["vst_state"] or "")
     asset = Path(vst_path).name if vst_path else file_asset
+    if not asset and tone3000_id:
+        asset = f"Tone3000 #{tone3000_id}"
     status = "ready"
     if kind == "none" or not asset:
         status = "missing"

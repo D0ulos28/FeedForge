@@ -1,5 +1,5 @@
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
@@ -229,6 +229,18 @@ ipcMain.handle("dialog:pickDemucsInstallDir", async (_event, options = {}) => {
   return folder;
 });
 
+ipcMain.handle("dialog:pickPythonExecutable", async (_event, options = {}) => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Choose python.exe",
+    defaultPath: validDefaultPath(options.defaultPath) || "C:\\Program Files",
+    properties: ["openFile"],
+    filters: [{ name: "Python executable", extensions: ["exe"] }]
+  });
+  const filePath = result.canceled ? null : result.filePaths[0];
+  logDebug("dialog.pickPythonExecutable", { selected: filePath || "" });
+  return filePath;
+});
+
 ipcMain.handle("converter:inspect", async (_event, inputPath, options = {}) => {
   logDebug("converter.inspect.start", {
     inputPath,
@@ -289,19 +301,24 @@ ipcMain.handle("converter:convert", async (_event, payload) => {
   if (payload.demucsApiKey) args.push("--demucs-api-key", payload.demucsApiKey);
   args.push(...rigBuilderArgs(payload.rigBuilderDataDir));
   const result = await runConverter(args);
-  const outputMatch = result.stdout.match(/wrote\s+(.+)/i);
+  const outputPaths = [...result.stdout.matchAll(/^wrote\s+(.+)$/gim)].map((match) => match[1].trim()).filter(Boolean);
+  const outputMatch = outputPaths[0] || null;
   logDebug(result.code === 0 ? "converter.convert.ok" : "converter.convert.failed", {
     inputPath: payload.inputPath,
-    outputPath: outputMatch ? outputMatch[1].trim() : payload.outputPath || "",
+    outputPath: outputMatch || payload.outputPath || "",
+    outputCount: outputPaths.length,
     code: result.code,
     stdoutTail: tail(result.stdout),
     stderrTail: tail(result.stderr),
     diagnostics: result.diagnostics
   });
-  const seed = payload.includeTones === false || result.code !== 0 ? null : await seedRigBuilder(payload.inputPath, payload);
+  const seed = payload.includeTones === false || result.code !== 0 || outputPaths.length > 1
+    ? null
+    : await seedRigBuilder(payload.inputPath, payload);
   return {
     ok: result.code === 0,
-    outputPath: outputMatch ? outputMatch[1].trim() : null,
+    outputPath: outputMatch,
+    outputPaths,
     seed,
     stdout: result.stdout,
     stderr: result.stderr,
@@ -323,6 +340,7 @@ ipcMain.handle("stemServer:models", async (_event, options = {}) => {
   return {
     defaultInstallDir: defaultDemucsInstallRoot(),
     installRoot,
+    devices: await demucsDeviceOptions(installRoot),
     models: modelInstallStates(installRoot)
   };
 });
@@ -334,6 +352,41 @@ ipcMain.handle("stemServer:start", async (_event, options = {}) => {
 ipcMain.handle("stemServer:stop", async () => {
   stopStemServer();
   return stemServerStatus();
+});
+
+ipcMain.handle("app:debugLogInfo", async () => {
+  return debugLogInfo();
+});
+
+ipcMain.handle("app:openDebugLog", async () => {
+  const info = debugLogInfo();
+  if (info.path && fs.existsSync(info.path)) {
+    await shell.openPath(info.path);
+    return { ok: true, path: info.path };
+  }
+  if (info.folder) {
+    fs.mkdirSync(info.folder, { recursive: true });
+    await shell.openPath(info.folder);
+    return { ok: true, path: info.folder };
+  }
+  return { ok: false, error: "Debug log path is not available." };
+});
+
+ipcMain.handle("app:openDebugLogFolder", async () => {
+  const info = debugLogInfo();
+  if (!info.folder) return { ok: false, error: "Debug log folder is not available." };
+  fs.mkdirSync(info.folder, { recursive: true });
+  await shell.openPath(info.folder);
+  return { ok: true, path: info.folder };
+});
+
+ipcMain.handle("app:pythonInfo", async (_event, options = {}) => {
+  return pythonInfo(options);
+});
+
+ipcMain.handle("app:openPythonDownload", async () => {
+  await shell.openExternal("https://www.python.org/downloads/windows/");
+  return { ok: true };
 });
 
 ipcMain.handle("updates:check", async () => {
@@ -480,9 +533,13 @@ function safeGithubReleaseUrl(value) {
 async function startStemServer(options = {}) {
   const installRoot = demucsInstallRoot(options.installDir);
   const model = demucsModelId(options.model);
+  const device = demucsDeviceId(options.device);
+  const concurrency = demucsConcurrency(options.concurrency);
+  const pythonExe = pythonExecutablePath(options.pythonPath);
+  const torchIndex = demucsTorchIndex(device);
   const existing = await stemServerStatus();
   if (existing.running || stemServerStarting) {
-    if (existing.processRunning && (existing.installRoot !== installRoot || existing.model !== model)) {
+    if (existing.processRunning && (existing.installRoot !== installRoot || existing.model !== model || existing.requestedDevice !== device || existing.concurrency !== concurrency)) {
       stopStemServer();
     } else {
       return { ...existing, starting: stemServerStarting, url: LOCAL_STEM_SERVER_URL };
@@ -503,7 +560,7 @@ async function startStemServer(options = {}) {
   stemServerStarting = true;
   stemServerLog = [];
   fs.mkdirSync(installRoot, { recursive: true });
-  logDebug("stemServer.start", { scriptPath, installRoot, model });
+  logDebug("stemServer.start", { scriptPath, installRoot, model, device, concurrency, torchIndex, hasPythonOverride: Boolean(pythonExe) });
 
   stemServerProcess = spawn("powershell.exe", [
     "-NoProfile",
@@ -517,6 +574,10 @@ async function startStemServer(options = {}) {
       ...process.env,
       FEEDFORGE_DEMUCS_HOME: installRoot,
       FEEDFORGE_DEMUCS_MODEL: model,
+      FEEDFORGE_DEMUCS_DEVICE: device,
+      FEEDFORGE_DEMUCS_CONCURRENCY: String(concurrency),
+      FEEDFORGE_PYTHON_EXE: pythonExe,
+      FEEDFORGE_TORCH_INDEX: torchIndex,
       TORCH_HOME: path.join(installRoot, "model-cache", "torch"),
       XDG_CACHE_HOME: path.join(installRoot, "model-cache"),
       PIP_CACHE_DIR: path.join(installRoot, "pip-cache")
@@ -543,7 +604,7 @@ async function startStemServer(options = {}) {
     if (status.running) stemServerStarting = false;
   }, 3000);
 
-  return stemServerState({ ok: true, starting: true, installRoot, model });
+  return stemServerState({ ok: true, starting: true, installRoot, model, requestedDevice: device, concurrency });
 }
 
 async function stemServerStatus() {
@@ -556,6 +617,11 @@ async function stemServerStatus() {
     running: Boolean(health.body),
     healthy: Boolean(health.ok && health.body?.ok),
     model: health.body?.model || null,
+    device: health.body?.device || null,
+    requestedDevice: health.body?.requested_device || null,
+    concurrency: Number(health.body?.concurrency) || null,
+    accelerators: Array.isArray(health.body?.accelerators) ? health.body.accelerators : [],
+    capabilities: health.body?.capabilities || null,
     health: health.body || null,
     error: health.error || ""
   });
@@ -582,17 +648,77 @@ function stemServerState(extra = {}) {
   const processRunning = Boolean(stemServerProcess && stemServerProcess.exitCode === null);
   const running = Boolean(extra.running || processRunning);
   const healthy = Boolean(extra.healthy);
+  const progress = stemServerProgress(extra, healthy, running);
   return {
     ...extra,
     ok: Boolean(extra.ok),
     url: LOCAL_STEM_SERVER_URL,
     installRoot: extra.installRoot || defaultDemucsInstallRoot(),
     model: extra.model || null,
+    device: extra.device || null,
+    requestedDevice: extra.requestedDevice || null,
+    concurrency: extra.concurrency || null,
+    accelerators: extra.accelerators || [],
+    capabilities: extra.capabilities || null,
     running,
     starting: Boolean((extra.starting || stemServerStarting) && !running && !healthy),
     healthy,
     processRunning,
+    phase: progress.phase,
+    message: progress.message,
     log: stemServerLog.slice(-STEM_SERVER_LOG_LINES)
+  };
+}
+
+function stemServerProgress(extra, healthy, running) {
+  if (healthy) {
+    return {
+      phase: "ready",
+      message: `Ready on ${extra.device || "detected device"}.`
+    };
+  }
+  const lines = stemServerLog.slice(-30);
+  const text = lines.join("\n");
+  const lastImportant = [...lines].reverse().find((line) => /error|traceback|successfully installed|installing collected|using cached|downloading|collecting|uvicorn|running/i.test(line)) || "";
+  if (/traceback|error:/i.test(text)) {
+    return {
+      phase: "error",
+      message: lastImportant || extra.error || "The stem server reported an error. Open the debug log for details."
+    };
+  }
+  if (/successfully installed/i.test(text)) {
+    return {
+      phase: "loading",
+      message: "CUDA/Python packages installed. Loading Demucs and starting the local server."
+    };
+  }
+  if (/installing collected packages/i.test(text)) {
+    return {
+      phase: "installing",
+      message: "Installing Python, Demucs, and PyTorch packages. This can take several minutes on first GPU setup."
+    };
+  }
+  if (/using cached .*torch|downloading .*torch|collecting .*torch/i.test(text)) {
+    return {
+      phase: "downloading",
+      message: "Preparing the PyTorch runtime. CUDA builds are large and may take time on first setup."
+    };
+  }
+  if (extra.starting || stemServerStarting || processRunning) {
+    return {
+      phase: "starting",
+      message: "Starting the local stem server."
+    };
+  }
+  if (running) {
+    return {
+      phase: "unhealthy",
+      message: extra.error || "The port is reachable, but health did not pass yet."
+    };
+  }
+  return {
+    phase: "stopped",
+    message: "Local stem server is not running."
   };
 }
 
@@ -617,6 +743,158 @@ function demucsInstallRoot(value) {
 function demucsModelId(value) {
   const id = typeof value === "string" ? value.trim() : "";
   return DEMUCS_MODELS.some((model) => model.id === id) ? id : "htdemucs_6s";
+}
+
+function demucsDeviceId(value) {
+  const id = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!id || id === "auto" || id === "cpu" || id === "mps" || /^cuda(?::\d+)?$/.test(id)) {
+    return id || "auto";
+  }
+  return "auto";
+}
+
+function demucsConcurrency(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 1;
+  return Math.max(1, Math.min(Math.trunc(parsed), 4));
+}
+
+async function demucsDeviceOptions(installRoot) {
+  const fallback = [
+    {
+      id: "auto",
+      name: "Auto",
+      detail: "Installs and uses CUDA PyTorch when an NVIDIA GPU is detected, otherwise CPU.",
+      available: true,
+      recommended: true
+    },
+    { id: "cpu", name: "CPU", detail: "Compatible with every PC, but slow for stem splitting.", available: true }
+  ];
+  const python = path.join(installRoot, ".demucs-venv", "Scripts", "python.exe");
+  if (!fs.existsSync(python)) {
+    return mergeDeviceOptions(fallback, await systemGpuDeviceOptions());
+  }
+  const script = [
+    "import json",
+    "devices=[{'id':'auto','name':'Auto','detail':'Installs and uses CUDA PyTorch when an NVIDIA GPU is detected, otherwise CPU.','available':True,'recommended':True},{'id':'cpu','name':'CPU','detail':'Compatible with every PC, but slow for stem splitting.','available':True}]",
+    "try:",
+    " import torch",
+    " if torch.cuda.is_available():",
+    "  [devices.append({'id':f'cuda:{i}','name':torch.cuda.get_device_name(i),'detail':f'CUDA GPU, {round(torch.cuda.get_device_properties(i).total_memory/(1024**3),1)} GB VRAM','available':True,'recommended':i==0}) for i in range(torch.cuda.device_count())]",
+    " if hasattr(torch.backends,'mps') and torch.backends.mps.is_available(): devices.append({'id':'mps','name':'Apple GPU','detail':'Metal acceleration available.','available':True})",
+    "except Exception as exc:",
+    " devices.append({'id':'torch-error','name':'GPU detection unavailable','detail':str(exc),'available':False})",
+    "print(json.dumps(devices))"
+  ].join("\n");
+  try {
+    const result = await runProcess(python, ["-c", script], { cwd: installRoot, timeoutMs: 12000 });
+    if (result.code !== 0) {
+      logDebug("stemServer.devices.failed", { code: result.code, stderrTail: tail(result.stderr) });
+      return fallback;
+    }
+    const parsed = JSON.parse(result.stdout);
+    return mergeDeviceOptions(Array.isArray(parsed) && parsed.length ? parsed : fallback, await systemGpuDeviceOptions());
+  } catch (error) {
+    logDebug("stemServer.devices.error", errorToLog(error));
+    return mergeDeviceOptions(fallback, await systemGpuDeviceOptions());
+  }
+}
+
+async function systemGpuDeviceOptions() {
+  if (process.platform !== "win32") return [];
+  const result = await runProcess("nvidia-smi.exe", [
+    "--query-gpu=name,memory.total",
+    "--format=csv,noheader,nounits"
+  ], { timeoutMs: 5000 });
+  if (result.code !== 0 || !result.stdout.trim()) return [];
+  return result.stdout
+    .split(/\r?\n/)
+    .map((line, index) => {
+      const [name, memory] = line.split(",").map((part) => part.trim());
+      if (!name) return null;
+      const memoryGb = Number(memory) ? `${(Number(memory) / 1024).toFixed(1)} GB VRAM` : "VRAM unknown";
+      return {
+        id: `cuda:${index}`,
+        name,
+        detail: `NVIDIA GPU detected by nvidia-smi, ${memoryGb}. FeedForge will install CUDA PyTorch when this device is used.`,
+        available: true,
+        recommended: index === 0,
+        kind: "cuda"
+      };
+    })
+    .filter(Boolean);
+}
+
+function mergeDeviceOptions(primary, discovered) {
+  const byId = new Map();
+  for (const item of [...primary, ...discovered]) {
+    if (!item?.id || byId.has(item.id)) continue;
+    byId.set(item.id, item);
+  }
+  return [...byId.values()];
+}
+
+function demucsTorchIndex(device) {
+  if (String(device || "").startsWith("cuda")) {
+    return "https://download.pytorch.org/whl/cu128";
+  }
+  if (device === "auto") {
+    return "auto";
+  }
+  return "";
+}
+
+function runProcess(command, args, options = {}) {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const child = spawn(command, args, {
+      cwd: options.cwd || processWorkingDirectory(),
+      env: options.env || process.env,
+      windowsHide: true
+    });
+    const timer = options.timeoutMs ? setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill();
+      } catch {
+        // Best effort timeout cleanup.
+      }
+      resolve({ code: 1, stdout, stderr: `${stderr}\nProcess timed out after ${options.timeoutMs}ms.` });
+    }, options.timeoutMs) : null;
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ code: code ?? 0, stdout, stderr });
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ code: 1, stdout, stderr: `${stderr}\n${error.message}` });
+    });
+  });
+}
+
+function processWorkingDirectory() {
+  const appPath = app.getAppPath();
+  if (appPath && /\.asar$/i.test(appPath)) {
+    return path.dirname(appPath);
+  }
+  if (appPath && fs.existsSync(appPath)) {
+    try {
+      const stat = fs.statSync(appPath);
+      return stat.isDirectory() ? appPath : path.dirname(appPath);
+    } catch {
+      // Fall through to the executable directory.
+    }
+  }
+  return path.dirname(process.execPath);
 }
 
 function modelInstallStates(installRoot) {
@@ -874,6 +1152,184 @@ function initializeDebugLog() {
   } catch {
     debugLogPath = null;
   }
+}
+
+function debugLogInfo() {
+  const folder = debugLogPath ? path.dirname(debugLogPath) : path.join(app.getPath("userData"), "logs");
+  const previous = debugLogPath ? debugLogPath.replace(/\.log$/i, ".previous.log") : path.join(folder, "feedforge-debug.previous.log");
+  return {
+    path: debugLogPath || path.join(folder, "feedforge-debug.log"),
+    previousPath: previous,
+    folder,
+    exists: Boolean(debugLogPath && fs.existsSync(debugLogPath)),
+    previousExists: fs.existsSync(previous)
+  };
+}
+
+async function pythonInfo(options = {}) {
+  const installRoot = demucsInstallRoot(options.installDir);
+  const candidates = pythonCandidates(installRoot, options.pythonPath);
+  const errors = [];
+  for (const candidate of candidates) {
+    const result = await runProcess(candidate.command, candidate.args, { timeoutMs: 8000 });
+    if (result.code !== 0) {
+      errors.push(`${candidate.command}: ${tail(result.stderr || result.stdout, 400)}`);
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(result.stdout.trim().split(/\r?\n/).pop() || "{}");
+      const major = Number(parsed.major);
+      const minor = Number(parsed.minor);
+      const supported = major > 3 || (major === 3 && minor >= 11);
+      return {
+        ok: supported,
+        found: true,
+        supported,
+        executable: parsed.executable || candidate.command,
+        version: parsed.version || "",
+        source: candidate.source,
+        message: supported
+          ? `Python ${parsed.version} is ready for stem splitting${candidate.source ? ` (${candidate.source})` : ""}.`
+          : `Python ${parsed.version || ""} was found, but FeedForge needs Python 3.11 or newer.`,
+      };
+    } catch (error) {
+      errors.push(`${candidate.command}: invalid version response`);
+    }
+  }
+  logDebug("python.detect.failed", {
+    installRoot,
+    candidateCount: candidates.length,
+    candidates: candidates.map((candidate) => ({ command: candidate.command, source: candidate.source })),
+    errors
+  });
+  return {
+    ok: false,
+    found: false,
+    supported: false,
+    executable: "",
+    version: "",
+    message: "Python 3.11 or newer was not found. Install Python 3.11+ from python.org or select a Demucs folder that already has a FeedForge stem environment.",
+    errors,
+  };
+}
+
+function pythonCandidates(installRoot, pythonPath) {
+  const code = "import json, sys; print(json.dumps({'executable': sys.executable, 'version': sys.version.split()[0], 'major': sys.version_info.major, 'minor': sys.version_info.minor}))";
+  const candidates = [];
+  const addExe = (command, source, args = ["-c", code]) => {
+    if (!command) return;
+    if (path.isAbsolute(command) && !fs.existsSync(command)) return;
+    if (candidates.some((candidate) => candidate.command.toLowerCase() === command.toLowerCase() && candidate.args.join("\u0000") === args.join("\u0000"))) return;
+    candidates.push({ command, args, source });
+  };
+
+  addExe(pythonExecutablePath(pythonPath), "selected Python");
+  addExe(path.join(installRoot, ".demucs-venv", "Scripts", "python.exe"), "FeedForge local stem environment");
+  for (const command of registryPythonExecutables()) {
+    addExe(command, "Windows Python registry");
+  }
+  addExe("python.exe", "PATH");
+  addExe("py.exe", "Python launcher", ["-3", "-c", code]);
+
+  for (const root of [
+    installRoot,
+    process.env.ProgramFiles,
+    process.env["ProgramFiles(x86)"],
+    process.env.LOCALAPPDATA,
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
+    path.join(osHome(), "AppData", "Local", "Programs", "Python"),
+  ].filter(Boolean)) {
+    for (const command of findPythonExecutables(root)) {
+      addExe(command, "standard install");
+    }
+  }
+
+  return candidates;
+}
+
+function pythonExecutablePath(value) {
+  if (typeof value !== "string" || !value.trim()) return "";
+  const resolved = path.resolve(value.trim());
+  try {
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isFile() && path.basename(resolved).toLowerCase() === "python.exe") {
+      return resolved;
+    }
+    const nested = path.join(resolved, "python.exe");
+    if (fs.existsSync(nested)) return nested;
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+function registryPythonExecutables() {
+  if (process.platform !== "win32") return [];
+  const roots = [
+    "HKCU\\Software\\Python\\PythonCore",
+    "HKLM\\Software\\Python\\PythonCore",
+    "HKLM\\Software\\WOW6432Node\\Python\\PythonCore"
+  ];
+  const executables = [];
+  for (const root of roots) {
+    let output = "";
+    try {
+      output = execFileSync("reg.exe", ["query", root, "/s", "/v", "ExecutablePath"], {
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 5000
+      });
+    } catch {
+      continue;
+    }
+    for (const line of output.split(/\r?\n/)) {
+      const match = line.match(/ExecutablePath\s+REG_\w+\s+(.+?)\s*$/i);
+      if (match?.[1]) executables.push(match[1].trim());
+    }
+  }
+  return executables;
+}
+
+function findPythonExecutables(root) {
+  const executables = [];
+  const seen = new Set();
+  const queue = [{ dir: root, depth: 0 }];
+  const maxDepth = 4;
+  const maxDirs = 600;
+
+  while (queue.length && seen.size < maxDirs) {
+    const { dir, depth } = queue.shift();
+    const normalized = path.resolve(dir).toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+
+    const direct = path.join(dir, "python.exe");
+    if (fs.existsSync(direct)) executables.push(direct);
+    if (depth >= maxDepth) continue;
+
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const name = entry.name;
+      if (!pythonSearchDirName(name, depth)) continue;
+      queue.push({ dir: path.join(dir, name), depth: depth + 1 });
+    }
+  }
+  return executables;
+}
+
+function pythonSearchDirName(name, depth) {
+  if (/^Python\d+/i.test(name)) return true;
+  if (/^\.demucs-venv$/i.test(name)) return true;
+  if (/^(Scripts|Programs|Python|PythonCore)$/i.test(name)) return true;
+  if (/^(Program Files|Program Files \(x86\))$/i.test(name)) return true;
+  if (depth === 0 && /^(Python|Programs|feedforge|demucs-server)$/i.test(name)) return true;
+  return false;
 }
 
 function logDebug(event, details = {}) {

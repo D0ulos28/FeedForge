@@ -251,6 +251,9 @@ def test_convert_psarc_writes_valid_feedpak_directory(tmp_path, monkeypatch):
         {"t": 0.0, "name": "Clean", "rig": "tone-0-clean"},
         {"t": 5.0, "name": "Drive", "rig": "tone-1-drive"},
     ]
+    assert arrangement["stats"] == {"events": 4, "notes": 8}
+    assert manifest["arrangements"][0]["event_count"] == 4
+    assert manifest["arrangements"][0]["note_count"] == 8
     assert [tone["Name"] for tone in arrangement["tones"]["definitions"]] == ["Clean", "Drive"]
     clean_gear = arrangement["tones"]["definitions"][0]["GearList"]
     drive_gear = arrangement["tones"]["definitions"][1]["GearList"]
@@ -295,6 +298,34 @@ def test_convert_psarc_writes_valid_feedpak_directory(tmp_path, monkeypatch):
             check=False,
         )
         assert validation.returncode == 0, validation.stdout
+
+
+def test_rs1_multisong_grouping_keeps_song_specific_audio():
+    content = {
+        "songs/bin/generic/first_lead.sng": b"first-sng",
+        "songs/bin/generic/first_bass.sng": b"first-bass-sng",
+        "songs/bin/generic/second_lead.sng": b"second-sng",
+        "manifests/songs_rs1disc/first_lead.json": json.dumps(
+            {"Entries": {"a": {"Attributes": {"SongKey": "First", "SongName": "First Song"}}}}
+        ).encode(),
+        "manifests/songs_rs1disc/second_lead.json": json.dumps(
+            {"Entries": {"b": {"Attributes": {"SongKey": "Second", "SongName": "Second Song"}}}}
+        ).encode(),
+        "audio/windows/song_first.bnk": b"\x00" * 44 + (123456).to_bytes(4, "little"),
+        "audio/windows/song_second.bnk": b"\x00" * 44 + (777777).to_bytes(4, "little"),
+        "audio/windows/123456.wem": b"first-audio",
+        "audio/windows/777777.wem": b"second-audio",
+    }
+
+    groups = converter._song_groups(content)
+    assert sorted(groups) == ["first", "second"]
+
+    first = converter._content_for_song_group(content, "first", groups["first"])
+    second = converter._content_for_song_group(content, "second", groups["second"])
+    assert "audio/windows/123456.wem" in first
+    assert "audio/windows/777777.wem" not in first
+    assert "audio/windows/777777.wem" in second
+    assert "audio/windows/123456.wem" not in second
 
 
 def test_convert_psarc_can_package_demucs_stems(tmp_path, monkeypatch):

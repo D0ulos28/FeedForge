@@ -14,7 +14,7 @@ if __package__ in (None, ""):
 
 from feedback_converter import __version__
 from feedback_converter.batch import convert_many
-from feedback_converter.converter import convert_psarc
+from feedback_converter.converter import convert_psarc, convert_psarc_songs
 from feedback_converter.inspector import inspect_psarc
 from feedback_converter.rig_builder_seed import seed_rig_builder_routes
 
@@ -160,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
     if len(input_paths) == 1:
         output_path = _single_output_path(input_paths[0], output_arg)
         try:
-            result = convert_psarc(
+            results = convert_psarc_songs(
                 input_paths[0],
                 output_path,
                 archive=not args.directory,
@@ -178,9 +178,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
-        print(f"wrote {result.output_path}")
-        for warning in result.warnings:
-            print(f"warning: {warning.message}", file=sys.stderr)
+        for result in results:
+            print(f"wrote {result.output_path}")
+            for warning in result.warnings:
+                print(f"warning: {warning.message}", file=sys.stderr)
         return 0
 
     batch = convert_many(

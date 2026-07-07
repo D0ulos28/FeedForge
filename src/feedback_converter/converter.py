@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -58,6 +59,74 @@ class ConversionResult:
     warnings: list[ConversionWarning] = field(default_factory=list)
 
 
+def convert_psarc_songs(
+    input_psarc: Path,
+    output: Path | None = None,
+    *,
+    archive: bool = True,
+    overwrite: bool = False,
+    keep_workdir: bool = False,
+    include_tones: bool = True,
+    b_standard_to_7_string: bool = False,
+    separate_stems: bool = False,
+    demucs_url: str | None = None,
+    demucs_api_key: str | None = None,
+    demucs_stems: list[str] | None = None,
+) -> list[ConversionResult]:
+    """Convert a PSARC, splitting multi-song containers into one FeedPak per song."""
+    input_psarc = Path(input_psarc)
+    if not input_psarc.is_file():
+        raise FileNotFoundError(f"PSARC file not found: {input_psarc}")
+    with input_psarc.open("rb") as fh:
+        content = PSARC(crypto=True).parse_stream(fh)
+
+    groups = _song_groups(content)
+    if len(groups) <= 1:
+        return [
+            convert_psarc(
+                input_psarc,
+                output,
+                archive=archive,
+                overwrite=overwrite,
+                keep_workdir=keep_workdir,
+                include_tones=include_tones,
+                b_standard_to_7_string=b_standard_to_7_string,
+                separate_stems=separate_stems,
+                demucs_url=demucs_url,
+                demucs_api_key=demucs_api_key,
+                demucs_stems=demucs_stems,
+                _content=content,
+            )
+        ]
+
+    if output is None:
+        base_dir = input_psarc.parent
+    else:
+        output = Path(output)
+        base_dir = output.parent if output.suffix else output
+    results: list[ConversionResult] = []
+    for key, paths in sorted(groups.items()):
+        song_content = _content_for_song_group(content, key, paths)
+        output = base_dir / f"{_safe_output_stem(_metadata_song_title(song_content) or key)}.feedpak"
+        results.append(
+            convert_psarc(
+                input_psarc,
+                output,
+                archive=archive,
+                overwrite=overwrite,
+                keep_workdir=keep_workdir,
+                include_tones=include_tones,
+                b_standard_to_7_string=b_standard_to_7_string,
+                separate_stems=separate_stems,
+                demucs_url=demucs_url,
+                demucs_api_key=demucs_api_key,
+                demucs_stems=demucs_stems,
+                _content=song_content,
+            )
+        )
+    return results
+
+
 def convert_psarc(
     input_psarc: Path,
     output: Path | None = None,
@@ -71,6 +140,7 @@ def convert_psarc(
     demucs_url: str | None = None,
     demucs_api_key: str | None = None,
     demucs_stems: list[str] | None = None,
+    _content: dict[str, bytes] | None = None,
 ) -> ConversionResult:
     input_psarc = Path(input_psarc)
     if not input_psarc.is_file():
@@ -100,8 +170,11 @@ def convert_psarc(
     (package_dir / "stems").mkdir()
 
     warnings: list[ConversionWarning] = []
-    with input_psarc.open("rb") as fh:
-        content = PSARC(crypto=True).parse_stream(fh)
+    if _content is None:
+        with input_psarc.open("rb") as fh:
+            content = PSARC(crypto=True).parse_stream(fh)
+    else:
+        content = _content
 
     metadata = _extract_metadata(content)
     sng_items = _find_sng_entries(content)
@@ -159,6 +232,8 @@ def convert_psarc(
                 "tuning": arrangement["tuning"],
                 "capo": max(0, int(arrangement.get("capo", 0))),
                 "type": _arrangement_type(arr_id),
+                "event_count": _arrangement_event_count(arrangement),
+                "note_count": _arrangement_note_count(arrangement),
             }
         )
 
@@ -189,6 +264,8 @@ def convert_psarc(
                         "tuning": [0, 0, 0, 0, 0, 0],
                         "capo": 0,
                         "type": "vocals",
+                        "event_count": len(lyrics),
+                        "note_count": len(lyrics),
                     }
                 )
         else:
@@ -288,6 +365,93 @@ def _find_sng_entries(content: dict[str, bytes]) -> list[tuple[str, bytes]]:
         if path.lower().endswith(".sng") and "/bin/" in path.replace("\\", "/").lower()
     ]
     return sorted(entries, key=lambda item: item[0].lower())
+
+
+ARRANGEMENT_SUFFIX_RE = re.compile(
+    r"_(?:lead|lead\d+|rhythm|rhythm\d+|combo|combo\d+|bass|bass\d+|vocals?|showlights)$",
+    re.IGNORECASE,
+)
+
+
+def _song_groups(content: dict[str, bytes]) -> dict[str, set[str]]:
+    groups: dict[str, set[str]] = {}
+    for path, data in content.items():
+        key = ""
+        if path.lower().endswith((".json", ".hsan")):
+            key = _song_key_from_manifest(data) or _song_group_key_from_path(path)
+        elif path.lower().endswith(".sng"):
+            key = _song_group_key_from_path(path)
+        if key:
+            groups.setdefault(key.lower(), set()).add(path)
+    return {key: paths for key, paths in groups.items() if any(path.lower().endswith(".sng") for path in paths)}
+
+
+def _song_key_from_manifest(data: bytes) -> str:
+    try:
+        obj = json.loads(data.decode("utf-8-sig"))
+    except Exception:  # noqa: BLE001
+        return ""
+    for item in _walk_dicts(obj):
+        value = item.get("SongKey") or item.get("DLCKey")
+        if value not in (None, ""):
+            return _slug(str(value))
+    return ""
+
+
+def _song_group_key_from_path(path: str) -> str:
+    stem = Path(path.replace("\\", "/")).stem
+    return _slug(ARRANGEMENT_SUFFIX_RE.sub("", stem))
+
+
+def _content_for_song_group(content: dict[str, bytes], key: str, paths: set[str]) -> dict[str, bytes]:
+    key = key.lower()
+    selected = {path: content[path] for path in paths if path in content}
+
+    for path, data in content.items():
+        low = path.replace("\\", "/").lower()
+        stem_key = _song_group_key_from_path(path)
+        if low.endswith((".json", ".hsan", ".sng", ".xml", ".dds")) and stem_key == key:
+            selected[path] = data
+        elif f"album_{key}_" in low or f"album_{key}." in low:
+            selected[path] = data
+
+    bnk_paths = [
+        path for path in content
+        if path.replace("\\", "/").lower().endswith(".bnk")
+        and Path(path.replace("\\", "/")).stem.lower() in {f"song_{key}", f"{key}"}
+    ]
+    wem_paths = _wem_paths_for_banks(content, bnk_paths)
+    for path in wem_paths:
+        selected[path] = content[path]
+    return selected
+
+
+def _wem_paths_for_banks(content: dict[str, bytes], bnk_paths: list[str]) -> set[str]:
+    wem_by_id = {
+        int(Path(path).stem): path
+        for path in content
+        if path.lower().endswith(".wem") and Path(path).stem.isdigit()
+    }
+    found: set[str] = set()
+    for bnk_path in bnk_paths:
+        data = content.get(bnk_path, b"")
+        for offset in range(0, max(0, len(data) - 3)):
+            value = struct.unpack_from("<I", data, offset)[0]
+            if value in wem_by_id:
+                found.add(wem_by_id[value])
+    return found
+
+
+def _metadata_song_title(content: dict[str, bytes]) -> str:
+    meta = _extract_metadata(content)
+    artist = str(meta.get("artist") or "").strip()
+    title = str(meta.get("title") or "").strip()
+    return f"{artist} - {title}".strip(" -") if artist or title else ""
+
+
+def _safe_output_stem(value: str) -> str:
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value).strip(" ._")
+    return safe[:120] or "converted"
 
 
 def _is_vocal_sng(path: str, song: Any) -> bool:
@@ -529,12 +693,30 @@ def _song_to_arrangement(
         "beats": [_beat_to_feedpak(b) for b in song.beats],
         "sections": [_section_to_feedpak(s) for s in song.sections],
     }
+    arrangement["stats"] = {
+        "events": _arrangement_event_count(arrangement),
+        "notes": _arrangement_note_count(arrangement),
+    }
     if include_tones:
         tones = _song_tones_to_feedpak(song, source_path, metadata)
         if tones:
             arrangement["tones"] = tones["tones"]
             arrangement["_rigs"] = tones["rigs"]
     return arrangement
+
+
+def _arrangement_event_count(arrangement: dict[str, Any]) -> int:
+    return len(arrangement.get("notes") or []) + len(arrangement.get("chords") or [])
+
+
+def _arrangement_note_count(arrangement: dict[str, Any]) -> int:
+    total = len(arrangement.get("notes") or [])
+    for chord in arrangement.get("chords") or []:
+        if isinstance(chord, dict) and isinstance(chord.get("notes"), list):
+            total += len(chord["notes"])
+        else:
+            total += 1
+    return total
 
 
 def _highest_level(song: Any) -> Any:
@@ -1123,6 +1305,10 @@ def _b_standard_arrangement_to_seven_string(arrangement: dict[str, Any]) -> dict
     converted["notes"] = [_convert_note_to_seven_string(note) for note in converted.get("notes", [])]
     converted["chords"] = [_convert_chord_to_seven_string(chord) for chord in converted.get("chords", [])]
     converted["templates"] = [_convert_template_to_seven_string(template) for template in converted.get("templates", [])]
+    converted["stats"] = {
+        "events": _arrangement_event_count(converted),
+        "notes": _arrangement_note_count(converted),
+    }
     for phrase in converted.get("phrases", []):
         for level in phrase.get("levels", []):
             level["notes"] = [_convert_note_to_seven_string(note) for note in level.get("notes", [])]
@@ -1575,6 +1761,13 @@ def _maybe_write_vocal_pitch(
     resolved_url = _resolve_demucs_url(demucs_url)
     if not resolved_url:
         return None
+    if not _demucs_supports_pitch(resolved_url, demucs_api_key):
+        warnings.append(
+            ConversionWarning(
+                "Karaoke pitch generation skipped: the configured Demucs server does not expose pitch generation."
+            )
+        )
+        return None
     try:
         notes = _run_pitch_server(
             vocals_path,
@@ -1591,6 +1784,23 @@ def _maybe_write_vocal_pitch(
     path = "vocal_pitch.json"
     _write_json(package_dir / path, {"version": 1, "notes": notes})
     return path
+
+
+def _demucs_supports_pitch(server_url: str, api_key: str | None) -> bool:
+    headers = {}
+    api_key = api_key or _feedback_demucs_api_key()
+    if api_key:
+        headers["X-API-Key"] = api_key
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(f"{server_url}/health", headers=headers)
+    try:
+        response = _read_json_response(req, timeout=10)
+    except Exception:  # noqa: BLE001
+        return True
+    capabilities = response.get("capabilities")
+    if isinstance(capabilities, dict) and capabilities.get("pitch") is False:
+        return False
+    return True
 
 
 def _run_pitch_server(

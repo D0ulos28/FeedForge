@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 import sys
 import tempfile
@@ -7,13 +8,22 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_MODEL = "htdemucs_6s"
+DEFAULT_DEVICE = "auto"
+DEFAULT_CONCURRENCY = 1
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7865
 ALLOWED_STEMS = {"guitar", "bass", "drums", "vocals", "piano", "other"}
 _MODEL_CACHE: dict[str, Any] = {}
+_DEVICE_CACHE: dict[str, str] = {}
 
 
-def create_app(storage_dir: Path | None = None, *, model: str = DEFAULT_MODEL) -> Any:
+def create_app(
+    storage_dir: Path | None = None,
+    *,
+    model: str = DEFAULT_MODEL,
+    device: str = DEFAULT_DEVICE,
+    concurrency: int = DEFAULT_CONCURRENCY,
+) -> Any:
     try:
         from fastapi import FastAPI, File, HTTPException, UploadFile
         from fastapi.responses import FileResponse
@@ -28,15 +38,22 @@ def create_app(storage_dir: Path | None = None, *, model: str = DEFAULT_MODEL) -
     jobs_dir = root / "jobs"
     uploads_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir.mkdir(parents=True, exist_ok=True)
+    separation_slots = asyncio.Semaphore(normalize_concurrency(concurrency))
 
     app = FastAPI(title="FeedForge Demucs Server")
 
     @app.get("/health")
     def health() -> dict[str, Any]:
+        resolved_device = resolve_device(device)
         return {
             "ok": _demucs_available(),
             "service": "feedforge-demucs-server",
             "model": model,
+            "device": resolved_device,
+            "requested_device": device,
+            "concurrency": normalize_concurrency(concurrency),
+            "accelerators": detect_accelerators(),
+            "capabilities": {"separate": True, "pitch": False},
             "demucs_available": _demucs_available(),
         }
 
@@ -59,7 +76,8 @@ def create_app(storage_dir: Path | None = None, *, model: str = DEFAULT_MODEL) -
         input_path.write_bytes(await file.read())
 
         try:
-            produced = run_demucs(input_path, job_dir, requested, model=model)
+            async with separation_slots:
+                produced = await asyncio.to_thread(run_demucs, input_path, job_dir, requested, model=model, device=device)
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -109,7 +127,22 @@ def normalize_stems(value: str | list[str]) -> list[str]:
     return stems
 
 
-def run_demucs(input_path: Path, job_dir: Path, stems: list[str], *, model: str = DEFAULT_MODEL) -> dict[str, Path]:
+def normalize_concurrency(value: int | str | None) -> int:
+    try:
+        parsed = int(value or DEFAULT_CONCURRENCY)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_CONCURRENCY
+    return max(1, min(parsed, 4))
+
+
+def run_demucs(
+    input_path: Path,
+    job_dir: Path,
+    stems: list[str],
+    *,
+    model: str = DEFAULT_MODEL,
+    device: str = DEFAULT_DEVICE,
+) -> dict[str, Path]:
     input_path = Path(input_path)
     job_dir = Path(job_dir)
     if not stems:
@@ -123,7 +156,8 @@ def run_demucs(input_path: Path, job_dir: Path, stems: list[str], *, model: str 
     except ImportError as exc:
         raise RuntimeError(f"Demucs runtime dependencies are missing: {exc}") from exc
 
-    demucs_model = load_demucs_model(model)
+    resolved_device = resolve_device(device)
+    demucs_model = load_demucs_model(model, device=resolved_device)
     data, samplerate = sf.read(input_path, always_2d=True, dtype="float32")
     wav = torch.from_numpy(data.T)
     wav = convert_audio(wav, samplerate, demucs_model.samplerate, demucs_model.audio_channels)
@@ -135,7 +169,7 @@ def run_demucs(input_path: Path, job_dir: Path, stems: list[str], *, model: str 
             split=True,
             overlap=0.25,
             progress=False,
-            device="cpu",
+            device=resolved_device,
         )[0]
 
     produced: dict[str, Path] = {}
@@ -153,19 +187,79 @@ def run_demucs(input_path: Path, job_dir: Path, stems: list[str], *, model: str 
     return produced
 
 
-def load_demucs_model(model: str = DEFAULT_MODEL) -> Any:
+def load_demucs_model(model: str = DEFAULT_MODEL, *, device: str = DEFAULT_DEVICE) -> Any:
     try:
         from demucs.pretrained import get_model
     except ImportError as exc:
         raise RuntimeError(f"Demucs runtime dependencies are missing: {exc}") from exc
 
-    demucs_model = _MODEL_CACHE.get(model)
+    resolved_device = resolve_device(device)
+    cache_key = f"{model}:{resolved_device}"
+    demucs_model = _MODEL_CACHE.get(cache_key)
     if demucs_model is None:
         demucs_model = get_model(model)
-        demucs_model.cpu()
+        demucs_model.to(resolved_device)
         demucs_model.eval()
-        _MODEL_CACHE[model] = demucs_model
+        _MODEL_CACHE[cache_key] = demucs_model
     return demucs_model
+
+
+def resolve_device(requested: str | None = DEFAULT_DEVICE) -> str:
+    key = str(requested or DEFAULT_DEVICE).strip().lower()
+    if key in _DEVICE_CACHE:
+        return _DEVICE_CACHE[key]
+    try:
+        import torch
+    except Exception:  # noqa: BLE001
+        _DEVICE_CACHE[key] = "cpu"
+        return "cpu"
+
+    if key in {"", "auto"}:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            resolved = "cuda:0"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            resolved = "mps"
+        else:
+            resolved = "cpu"
+    elif key == "cuda":
+        resolved = "cuda:0" if torch.cuda.is_available() else "cpu"
+    elif key.startswith("cuda"):
+        resolved = key if torch.cuda.is_available() else "cpu"
+    elif key == "mps":
+        resolved = "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"
+    else:
+        resolved = "cpu"
+
+    _DEVICE_CACHE[key] = resolved
+    return resolved
+
+
+def detect_accelerators() -> list[dict[str, Any]]:
+    devices: list[dict[str, Any]] = [{"id": "cpu", "name": "CPU", "kind": "cpu", "available": True}]
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001
+        devices[0]["note"] = f"PyTorch unavailable: {exc}"
+        return devices
+
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(index)
+            memory_gb = round(float(getattr(props, "total_memory", 0)) / (1024**3), 1)
+            devices.append(
+                {
+                    "id": f"cuda:{index}",
+                    "name": torch.cuda.get_device_name(index),
+                    "kind": "cuda",
+                    "available": True,
+                    "memory_gb": memory_gb,
+                }
+            )
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        devices.append({"id": "mps", "name": "Apple GPU", "kind": "mps", "available": True})
+
+    return devices
 
 
 def _find_stem_file(source_dir: Path, stem: str) -> Path | None:
@@ -196,6 +290,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--device", default=DEFAULT_DEVICE)
+    parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--storage-dir", type=Path)
     parser.add_argument("--preload-model", action="store_true")
     return parser
@@ -213,12 +309,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.preload_model:
         try:
-            load_demucs_model(args.model)
+            load_demucs_model(args.model, device=args.device)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-    app = create_app(args.storage_dir, model=args.model)
-    print(json.dumps({"url": f"http://{args.host}:{args.port}", "model": args.model}))
+    concurrency = normalize_concurrency(args.concurrency)
+    app = create_app(args.storage_dir, model=args.model, device=args.device, concurrency=concurrency)
+    print(
+        json.dumps(
+            {
+                "url": f"http://{args.host}:{args.port}",
+                "model": args.model,
+                "device": resolve_device(args.device),
+                "concurrency": concurrency,
+            }
+        )
+    )
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
 

@@ -45,11 +45,18 @@ function App() {
   const [demucsUrl, setDemucsUrl] = useState(() => initialSettingsRef.current.demucsUrl || "");
   const [demucsApiKey, setDemucsApiKey] = useState("");
   const [demucsInstallDir, setDemucsInstallDir] = useState(() => initialSettingsRef.current.demucsInstallDir || "");
+  const [pythonPath, setPythonPath] = useState(() => initialSettingsRef.current.pythonPath || "");
   const [demucsModel, setDemucsModel] = useState(() => initialSettingsRef.current.demucsModel || "htdemucs_6s");
+  const [demucsDevice, setDemucsDevice] = useState(() => initialSettingsRef.current.demucsDevice || "auto");
+  const [demucsStemJobs, setDemucsStemJobs] = useState(() => Number(initialSettingsRef.current.demucsStemJobs) || 1);
+  const [demucsDevices, setDemucsDevices] = useState(defaultDemucsDevices());
   const [demucsModels, setDemucsModels] = useState([]);
   const [demucsModelRoot, setDemucsModelRoot] = useState("");
   const [stemServerStatus, setStemServerStatus] = useState({ url: "http://127.0.0.1:7865", running: false, starting: false, healthy: false });
   const [isStartingStemServer, setIsStartingStemServer] = useState(false);
+  const [debugLogInfo, setDebugLogInfo] = useState(null);
+  const [pythonInfo, setPythonInfo] = useState(null);
+  const [isCheckingPython, setIsCheckingPython] = useState(false);
   const [updateInfo, setUpdateInfo] = useState(null);
   const [rigBuilderDataDir, setRigBuilderDataDir] = useState(() => initialSettingsRef.current.rigBuilderDataDir || "");
   const [conversionWorkers, setConversionWorkers] = useState(DEFAULT_CONVERSION_WORKERS);
@@ -59,6 +66,7 @@ function App() {
   const [albumFilter, setAlbumFilter] = useState("all");
   const [tuningFilter, setTuningFilter] = useState("all");
   const [activeView, setActiveView] = useState("workspace");
+  const [settingsSection, setSettingsSection] = useState("conversion");
   const [isConverting, setIsConverting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const itemsRef = useRef(items);
@@ -72,8 +80,8 @@ function App() {
   }, [items]);
 
   useEffect(() => {
-    writeSettings({ outputDir, lastSourcePath, includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, demucsModel, rigBuilderDataDir });
-  }, [outputDir, lastSourcePath, includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, demucsModel, rigBuilderDataDir]);
+    writeSettings({ outputDir, lastSourcePath, includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, pythonPath, demucsModel, demucsDevice, demucsStemJobs, rigBuilderDataDir });
+  }, [outputDir, lastSourcePath, includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, pythonPath, demucsModel, demucsDevice, demucsStemJobs, rigBuilderDataDir]);
 
   useEffect(() => {
     let cancelled = false;
@@ -85,40 +93,71 @@ function App() {
         if (!cancelled) setUpdateInfo(null);
       }
     }
-    check();
+    const timer = window.setTimeout(check, 3500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadLogInfo() {
+      try {
+        const info = await api.getDebugLogInfo();
+        if (!cancelled) setDebugLogInfo(info);
+      } catch {
+        if (!cancelled) setDebugLogInfo(null);
+      }
+    }
+    loadLogInfo();
     return () => {
       cancelled = true;
     };
   }, []);
 
   useEffect(() => {
+    if (activeView !== "settings" || settingsSection !== "stems" || !separateStems) return undefined;
     let cancelled = false;
-    async function loadDemucsModels() {
+    async function loadStemPrereqs() {
       try {
-        const result = await api.getStemServerModels({ installDir: demucsInstallDir });
+        setIsCheckingPython(true);
+        const [result, python] = await Promise.all([
+          api.getStemServerModels({ installDir: demucsInstallDir }),
+          api.getPythonInfo({ installDir: demucsInstallDir, pythonPath }),
+        ]);
         if (cancelled) return;
         setDemucsModels(result.models || []);
+        setDemucsDevices(result.devices?.length ? result.devices : defaultDemucsDevices());
+        setPythonInfo(python);
         setDemucsModelRoot(result.installRoot || result.defaultInstallDir || "");
         if (!demucsInstallDir && result.defaultInstallDir) {
           setDemucsInstallDir(result.defaultInstallDir);
         }
       } catch {
         // Model metadata is helpful but not required for conversion.
+      } finally {
+        if (!cancelled) setIsCheckingPython(false);
       }
     }
-    loadDemucsModels();
+    loadStemPrereqs();
     return () => {
       cancelled = true;
     };
-  }, [demucsInstallDir]);
+  }, [activeView, settingsSection, separateStems, demucsInstallDir, pythonPath]);
 
   useEffect(() => {
-    if (!separateStems) return undefined;
+    if (!separateStems || activeView !== "settings" || settingsSection !== "stems") return undefined;
     let cancelled = false;
     async function refresh() {
       try {
         const status = await api.getStemServerStatus();
-        if (!cancelled) setStemServerStatus(status);
+        if (!cancelled) {
+          setStemServerStatus(status);
+          if (status.accelerators?.length) {
+            setDemucsDevices((current) => mergeDemucsDevices(current, status.accelerators));
+          }
+        }
       } catch {
         if (!cancelled) setStemServerStatus((current) => ({ ...current, running: false, healthy: false }));
       }
@@ -129,7 +168,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [separateStems]);
+  }, [separateStems, activeView, settingsSection]);
 
   useEffect(() => {
     return api.onDroppedPaths(async (paths) => {
@@ -218,6 +257,17 @@ function App() {
     setItems((current) => apply(current));
   }
 
+  function removeItem(id) {
+    if (isConvertingRef.current) return;
+    inspectionQueueRef.current = inspectionQueueRef.current.filter((queuedId) => queuedId !== id);
+    const nextItems = itemsRef.current.filter((item) => item.id !== id);
+    itemsRef.current = nextItems;
+    setItems(nextItems);
+    if (selectedId === id) {
+      setSelectedId(nextItems[0]?.id || null);
+    }
+  }
+
   function pumpInspectionQueue() {
     if (isConvertingRef.current) return;
     while (activeInspectionsRef.current < INSPECTION_WORKERS && inspectionQueueRef.current.length > 0) {
@@ -286,14 +336,37 @@ function App() {
     if (isStartingStemServer) return;
     setIsStartingStemServer(true);
     try {
-      const status = await api.startStemServer({ installDir: demucsInstallDir, model: demucsModel });
+      const status = await api.startStemServer({ installDir: demucsInstallDir, pythonPath, model: demucsModel, device: demucsDevice, concurrency: demucsStemJobs });
       setStemServerStatus(status);
       if (status.url) setDemucsUrl(status.url);
       const result = await api.getStemServerModels({ installDir: demucsInstallDir });
       setDemucsModels(result.models || []);
+      setDemucsDevices(result.devices?.length ? result.devices : defaultDemucsDevices());
       setDemucsModelRoot(result.installRoot || result.defaultInstallDir || "");
     } finally {
       setIsStartingStemServer(false);
+    }
+  }
+
+  async function recheckPython() {
+    setIsCheckingPython(true);
+    try {
+      setPythonInfo(await api.getPythonInfo({ installDir: demucsInstallDir, pythonPath }));
+    } finally {
+      setIsCheckingPython(false);
+    }
+  }
+
+  async function choosePythonExecutable() {
+    const selected = await api.pickPythonExecutable({ defaultPath: pythonPath || "C:\\Program Files\\Python313\\python.exe" });
+    if (selected) {
+      setPythonPath(selected);
+      setIsCheckingPython(true);
+      try {
+        setPythonInfo(await api.getPythonInfo({ installDir: demucsInstallDir, pythonPath: selected }));
+      } finally {
+        setIsCheckingPython(false);
+      }
     }
   }
 
@@ -438,6 +511,13 @@ function App() {
 
         {activeView === "settings" ? (
           <section className="settings-page">
+            <div className="settings-nav" aria-label="Settings sections">
+              <button className={settingsSection === "conversion" ? "active" : ""} onClick={() => setSettingsSection("conversion")}>Conversion</button>
+              <button className={settingsSection === "stems" ? "active" : ""} onClick={() => setSettingsSection("stems")}>Stem splitting</button>
+              <button className={settingsSection === "diagnostics" ? "active" : ""} onClick={() => setSettingsSection("diagnostics")}>Diagnostics</button>
+            </div>
+
+            {settingsSection === "conversion" && (
             <div className="settings-card">
               <div className="settings-card-head">
                 <div>
@@ -473,17 +553,52 @@ function App() {
                 </div>
               </div>
             </div>
+            )}
 
-            {separateStems && (
+            {settingsSection === "stems" && (
               <div className="settings-card">
                 <div className="settings-card-head">
                   <div>
-                    <h2>Stem Server</h2>
-                    <p>Local Demucs setup and optional remote server settings.</p>
+                    <h2>Stem splitting</h2>
+                    <p>Demucs setup, GPU selection, and split concurrency.</p>
                   </div>
                   <span className={`server-badge ${stemServerBadge(stemServerStatus, isStartingStemServer).toLowerCase()}`}>{stemServerBadge(stemServerStatus, isStartingStemServer)}</span>
                 </div>
+                {!separateStems ? (
+                  <div className="settings-empty">
+                    <strong>Stem splitting is disabled</strong>
+                    <span>Enable Separate stems in Conversion settings to configure the local Demucs server.</span>
+                    <button onClick={() => { setSettingsSection("conversion"); setSeparateStems(true); }}>Enable stems</button>
+                  </div>
+                ) : (
                 <div className="stem-settings">
+                  <div className="stem-summary">
+                    <div>
+                      <strong>{stemServerStatus.healthy ? "Ready" : "Setup managed by FeedForge"}</strong>
+                      <span>{stemServerStatus.healthy ? stemServerDetail(stemServerStatus, demucsModel, selectedDemucsModel(demucsModels, demucsModel)) : "FeedForge creates a local Python environment, installs Demucs/PyTorch, downloads the selected model, and reuses it later."}</span>
+                    </div>
+                  </div>
+                  <div className={`stem-prereq ${pythonInfo?.ok ? "ready" : pythonInfo?.found === false ? "missing" : ""}`}>
+                    <div>
+                      <strong>{pythonPrereqTitle(pythonInfo, isCheckingPython)}</strong>
+                      <span>{pythonInfo?.message || "Stem splitting needs Python 3.11 or newer installed on Windows. FeedForge handles Demucs, PyTorch, GPU runtime, and model downloads after Python is available."}</span>
+                      {pythonInfo?.executable && <em>{pythonInfo.executable}</em>}
+                    </div>
+                    <div className="prereq-actions">
+                      <button className="ghost" onClick={recheckPython} disabled={isCheckingPython}>{isCheckingPython ? "Checking" : "Recheck"}</button>
+                      {pythonInfo?.ok === false && <button onClick={() => api.openPythonDownload()}>Get Python</button>}
+                    </div>
+                  </div>
+                  <label>
+                    Python
+                    <div className="path-row">
+                      <input value={pythonPath} onChange={(event) => setPythonPath(event.target.value)} placeholder="Auto-detect, or choose python.exe if Windows discovery fails" disabled={isConverting || stemServerStatus.processRunning || stemServerBusy} />
+                      <button onClick={choosePythonExecutable} disabled={isConverting || stemServerStatus.processRunning || stemServerBusy}>
+                        <FolderOpen size={18} />
+                        Browse
+                      </button>
+                    </div>
+                  </label>
                   <label>
                     Model
                     <select value={demucsModel} onChange={(event) => setDemucsModel(event.target.value)} disabled={isConverting || stemServerStatus.processRunning || stemServerBusy}>
@@ -496,6 +611,30 @@ function App() {
                     <strong>{modelStatusLabel(selectedDemucsModel(demucsModels, demucsModel))} - {selectedDemucsModel(demucsModels, demucsModel)?.size || "Model size varies"}</strong>
                     <span>{selectedDemucsModel(demucsModels, demucsModel)?.description || "The selected model downloads on first local server start."}</span>
                     <em>{selectedDemucsModel(demucsModels, demucsModel)?.installed ? "Starting this model should reuse the local checkpoint." : `Cache checked in ${demucsModelRoot || "the selected install folder"} and the legacy Torch cache.`}</em>
+                  </div>
+                  <label>
+                    Processing device
+                    <select value={demucsDevice} onChange={(event) => setDemucsDevice(event.target.value)} disabled={isConverting || stemServerStatus.processRunning || stemServerBusy}>
+                      {demucsDevices.map((device) => (
+                        <option key={device.id} value={device.id} disabled={device.available === false}>
+                          {deviceLabel(device)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="demucs-device-note">
+                    <strong>{stemServerStatus.healthy ? `Active: ${resolvedDeviceLabel(stemServerStatus)}` : `Selected: ${selectedDemucsDevice(demucsDevices, demucsDevice)?.name || demucsDevice}`}</strong>
+                    <span>{deviceHelpText(selectedDemucsDevice(demucsDevices, demucsDevice), stemServerStatus)}</span>
+                  </div>
+                  <label>
+                    Stem jobs
+                    <select value={demucsStemJobs} onChange={(event) => setDemucsStemJobs(Number(event.target.value))} disabled={isConverting || stemServerStatus.processRunning || stemServerBusy}>
+                      {[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}
+                    </select>
+                  </label>
+                  <div className="demucs-device-note">
+                    <strong>{stemServerStatus.healthy ? `Server allows ${stemServerStatus.concurrency || 1} stem job${Number(stemServerStatus.concurrency || 1) === 1 ? "" : "s"}` : `Selected: ${demucsStemJobs} stem job${demucsStemJobs === 1 ? "" : "s"}`}</strong>
+                    <span>{stemJobHelpText(demucsStemJobs, stemServerStatus)}</span>
                   </div>
                   <div className="demucs-install-row">
                     <label>
@@ -516,18 +655,20 @@ function App() {
                     <input value={demucsApiKey} onChange={(event) => setDemucsApiKey(event.target.value)} placeholder="Optional" type="password" disabled={isConverting} />
                   </label>
                   <div className="local-stem-server">
-                    <div className={`server-state ${stemServerStatus.healthy ? "ready" : stemServerBusy ? "starting" : ""}`}>
+                    <div className={`server-state ${stemServerStatus.healthy ? "ready" : stemServerBusy ? "starting" : stemServerStatus.phase === "error" ? "error" : ""}`}>
                       <Server size={17} />
                       <div>
-                        <strong>{stemServerStatus.healthy ? "Local stem server ready" : stemServerBusy ? "Installing or starting stem server" : stemServerStatus.running ? "Stem server reachable, Demucs not ready" : "Local stem server not running"}</strong>
-                        <span>{stemServerStatus.healthy ? `${stemServerStatus.url} - ${stemServerStatus.model || demucsModel} is ready for conversions.` : stemServerStatus.running ? "The port is reachable, but health did not pass. Open the debug log if this stays unresolved." : selectedDemucsModel(demucsModels, demucsModel)?.installed ? "Selected model is installed. Starting should not download it again." : "First start downloads Python dependencies and the selected model into the install folder."}</span>
+                        <strong>{stemServerTitle(stemServerStatus, stemServerBusy)}</strong>
+                        <span>{stemServerDetail(stemServerStatus, demucsModel, selectedDemucsModel(demucsModels, demucsModel))}</span>
                       </div>
                     </div>
                     <div className="server-actions">
-                      <button onClick={startLocalStemServer} disabled={isConverting || stemServerBusy}>
-                        {stemServerBusy ? <RotateCw className="spin" size={17} /> : <Download size={17} />}
-                        {stemServerStatus.healthy ? "Use local stem server" : "Install/start local stem server"}
-                      </button>
+                      {!stemServerStatus.healthy && (
+                        <button onClick={startLocalStemServer} disabled={isConverting || stemServerBusy || pythonInfo?.ok === false}>
+                          {stemServerBusy ? <RotateCw className="spin" size={17} /> : <Download size={17} />}
+                          {stemServerStatus.running ? "Restart local stem server" : "Install/start local stem server"}
+                        </button>
+                      )}
                       {(stemServerStatus.processRunning || stemServerBusy) && (
                         <button className="ghost" onClick={stopLocalStemServer} disabled={isConverting}>
                           <Power size={17} />
@@ -535,6 +676,37 @@ function App() {
                         </button>
                       )}
                     </div>
+                  </div>
+                </div>
+                )}
+              </div>
+            )}
+
+            {settingsSection === "diagnostics" && (
+              <div className="settings-card">
+                <div className="settings-card-head">
+                  <div>
+                    <h2>Diagnostics</h2>
+                    <p>Debug logs and live stem server output.</p>
+                  </div>
+                </div>
+                <div className="diagnostics-panel standalone">
+                  <div className="diagnostics-head">
+                    <div>
+                      <strong>Debug log</strong>
+                      <span>{debugLogInfo?.path || "Debug log path will appear after app startup."}</span>
+                    </div>
+                    <div>
+                      <button className="ghost" onClick={() => api.openDebugLog()} disabled={!debugLogInfo?.path}>Open log</button>
+                      <button className="ghost" onClick={() => api.openDebugLogFolder()} disabled={!debugLogInfo?.folder}>Open folder</button>
+                    </div>
+                  </div>
+                  <div className="stem-log">
+                    {(stemServerStatus.log || []).length === 0 ? (
+                      <span>No live stem server output yet. Open Stem splitting and start the local server to see setup progress here.</span>
+                    ) : (
+                      stemServerStatus.log.slice(-18).map((line, index) => <code key={`${line}-${index}`}>{line}</code>)
+                    )}
                   </div>
                 </div>
               </div>
@@ -575,7 +747,7 @@ function App() {
             <section className="content-grid">
               <div className="left-column">
                 <DropZone onClick={chooseFiles} />
-                <Queue items={filtered} selectedId={selected?.id} onSelect={setSelectedId} />
+                <Queue items={filtered} selectedId={selected?.id} onSelect={setSelectedId} onRemove={removeItem} canRemove={!isConverting} />
               </div>
               <Inspector item={selected} />
             </section>
@@ -591,6 +763,35 @@ function stemServerBadge(status, isStarting) {
   if (status.starting || isStarting) return "Starting";
   if (status.running) return "Unhealthy";
   return "Stopped";
+}
+
+function stemServerTitle(status, busy) {
+  if (status.healthy) return "Local stem server ready";
+  if (status.phase === "downloading") return "Downloading runtime";
+  if (status.phase === "installing") return "Installing runtime";
+  if (status.phase === "loading") return "Loading Demucs";
+  if (status.phase === "error") return "Stem server error";
+  if (busy || status.starting) return "Installing or starting stem server";
+  if (status.running) return "Stem server reachable, Demucs not ready";
+  return "Local stem server not running";
+}
+
+function stemServerDetail(status, demucsModel, selectedModel) {
+  if (status.healthy) {
+    return `${status.url} - ${status.model || demucsModel} on ${resolvedDeviceLabel(status)} is ready for conversions.`;
+  }
+  if (status.message) return status.message;
+  if (status.running) return "The port is reachable, but health did not pass. Open the debug log if this stays unresolved.";
+  if (selectedModel?.installed) return "Selected model is installed. Starting this model should reuse the local checkpoint.";
+  return "First start downloads Python dependencies and the selected model into the install folder.";
+}
+
+function pythonPrereqTitle(info, checking) {
+  if (checking) return "Checking Python";
+  if (info?.ok) return `Python ${info.version} ready`;
+  if (info?.found) return "Python version unsupported";
+  if (info?.found === false) return "Python not found";
+  return "Python requirement";
 }
 
 function Metric({ label, value, tone = "" }) {
@@ -618,6 +819,85 @@ function selectedDemucsModel(models, modelId) {
   return (models || []).find((model) => model.id === modelId) || null;
 }
 
+function defaultDemucsDevices() {
+  return [
+    {
+      id: "auto",
+      name: "Auto",
+      detail: "Installs and uses CUDA PyTorch when an NVIDIA GPU is detected, otherwise CPU.",
+      available: true,
+      recommended: true
+    },
+    {
+      id: "cpu",
+      name: "CPU",
+      detail: "Compatible with every PC, but slow for stem splitting.",
+      available: true
+    }
+  ];
+}
+
+function selectedDemucsDevice(devices, deviceId) {
+  return (devices || []).find((device) => device.id === deviceId) || defaultDemucsDevices()[0];
+}
+
+function mergeDemucsDevices(current, accelerators) {
+  const byId = new Map();
+  for (const device of [...defaultDemucsDevices(), ...(current || [])]) {
+    if (device?.id) byId.set(device.id, device);
+  }
+  for (const device of accelerators || []) {
+    if (!device?.id) continue;
+    const detail = device.kind === "cuda"
+      ? `CUDA GPU, ${device.memory_gb || "unknown"} GB VRAM.`
+      : device.detail || "Detected by the running stem server.";
+    byId.set(device.id, {
+      ...device,
+      detail,
+      recommended: device.kind === "cuda" && device.id === "cuda:0"
+    });
+  }
+  return Array.from(byId.values());
+}
+
+function deviceLabel(device) {
+  const suffix = device.recommended ? " - recommended" : "";
+  const disabled = device.available === false ? " - unavailable" : "";
+  return `${device.name || device.id}${device.id && device.name !== device.id ? ` (${device.id})` : ""}${suffix}${disabled}`;
+}
+
+function deviceHelpText(device, status) {
+  if (status?.healthy) {
+    return `The running server reports ${resolvedDeviceLabel(status)}. GPU acceleration depends on the PyTorch build installed in the selected Demucs folder.`;
+  }
+  if (!device) return "Auto mode will use CUDA when available, otherwise CPU.";
+  if (device.id === "auto") return device.detail || "Auto mode will install and use CUDA PyTorch when an NVIDIA GPU is detected, otherwise CPU.";
+  if (device.kind === "cuda" || String(device.id || "").startsWith("cuda")) {
+    return device.detail || "CUDA should be much faster than CPU for stem splitting when enough VRAM is available.";
+  }
+  if (device.id === "cpu") return device.detail || "CPU mode is reliable, but usually much slower than GPU.";
+  return device.detail || "This device is reported by the local Demucs Python environment.";
+}
+
+function stemJobHelpText(value, status) {
+  const active = Number(status?.concurrency || value || 1);
+  if (active <= 1) {
+    return "Safest setting. Conversion workers can still prepare packages in parallel, while Demucs uses one GPU split at a time.";
+  }
+  if (active === 2) {
+    return "Experimental speed mode. Good GPUs may process two stem splits at once, but VRAM use is much higher.";
+  }
+  return "High risk. Use only on large VRAM GPUs; too many parallel Demucs jobs can be slower or fail with out-of-memory errors.";
+}
+
+function resolvedDeviceLabel(status) {
+  const id = status?.device || "";
+  const match = (status?.accelerators || []).find((device) => device.id === id);
+  if (!match) return id || "an unknown device";
+  const memory = match.memory_gb ? `, ${match.memory_gb} GB VRAM` : "";
+  return `${match.name || id} (${id}${memory})`;
+}
+
 function modelStatusLabel(model) {
   if (!model) return "Unknown";
   if (model.installed) return "Installed";
@@ -635,7 +915,7 @@ function DropZone({ onClick }) {
   );
 }
 
-function Queue({ items, selectedId, onSelect }) {
+function Queue({ items, selectedId, onSelect, onRemove, canRemove }) {
   const visibleItems = items.slice(0, QUEUE_RENDER_LIMIT);
   const hiddenCount = Math.max(0, items.length - visibleItems.length);
   return (
@@ -661,6 +941,26 @@ function Queue({ items, selectedId, onSelect }) {
               <span>{item.preview ? duration(item.preview.duration) : "-"}</span>
               <b>{statusText(item.status)}</b>
             </div>
+            {canRemove && item.status !== "converting" && (
+              <span
+                className="queue-remove"
+                role="button"
+                tabIndex={0}
+                title="Remove from queue"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onRemove(item.id);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" && event.key !== " ") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onRemove(item.id);
+                }}
+              >
+                <XCircle size={17} />
+              </span>
+            )}
           </button>
         ))}
         {hiddenCount > 0 && <div className="queue-limit">Showing first {QUEUE_RENDER_LIMIT} matches. Use search or filters to narrow {hiddenCount} more.</div>}
@@ -745,7 +1045,7 @@ function Inspector({ item }) {
                 <div className="arrangement" key={arrangement.id}>
                   <strong>{arrangement.name}</strong>
                   <span>{arrangement.difficulties} levels</span>
-                  <span>{arrangement.notes + arrangement.chords} events</span>
+                  <span>{arrangement.note_count || arrangement.notes + arrangement.chords} notes</span>
                 </div>
               ))}
             </div>

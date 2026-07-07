@@ -42,6 +42,7 @@ contextBridge.exposeInMainWorld("feedbackConverter", {
   pickOutput: (options) => ipcRenderer.invoke("dialog:pickOutput", options),
   pickRigBuilderData: (options) => ipcRenderer.invoke("dialog:pickRigBuilderData", options),
   pickDemucsInstallDir: (options) => ipcRenderer.invoke("dialog:pickDemucsInstallDir", options),
+  pickPythonExecutable: (options) => ipcRenderer.invoke("dialog:pickPythonExecutable", options),
   expandPaths: (paths) => ipcRenderer.invoke("files:expandPaths", paths),
   onDroppedPaths: (callback) => {
     const listener = (event) => callback(event.detail);
@@ -55,6 +56,11 @@ contextBridge.exposeInMainWorld("feedbackConverter", {
   getStemServerModels: (options) => ipcRenderer.invoke("stemServer:models", options),
   startStemServer: (options) => ipcRenderer.invoke("stemServer:start", options),
   stopStemServer: () => ipcRenderer.invoke("stemServer:stop"),
+  getDebugLogInfo: () => ipcRenderer.invoke("app:debugLogInfo"),
+  openDebugLog: () => ipcRenderer.invoke("app:openDebugLog"),
+  openDebugLogFolder: () => ipcRenderer.invoke("app:openDebugLogFolder"),
+  getPythonInfo: (options) => ipcRenderer.invoke("app:pythonInfo", options),
+  openPythonDownload: () => ipcRenderer.invoke("app:openPythonDownload"),
   checkForUpdates: () => ipcRenderer.invoke("updates:check"),
   openLatestRelease: (url) => ipcRenderer.invoke("updates:openLatest", url)
 });

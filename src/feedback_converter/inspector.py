@@ -32,6 +32,8 @@ class ArrangementPreview:
     difficulties: int
     notes: int
     chords: int
+    event_count: int
+    note_count: int
 
 
 @dataclass(frozen=True)
@@ -145,11 +147,14 @@ def inspect_psarc(input_psarc: Path, *, cover_dir: Path | None = None) -> PsarcP
         highest = _highest_level(song)
         note_count = 0
         chord_count = 0
+        playable_count = 0
         for note in highest.notes:
             if int(note.chordId) == 0xFFFFFFFF:
                 note_count += 1
+                playable_count += 1
             else:
                 chord_count += 1
+                playable_count += _preview_chord_note_count(song, int(note.chordId))
         arrangements.append(
             ArrangementPreview(
                 id=arr_id,
@@ -160,6 +165,8 @@ def inspect_psarc(input_psarc: Path, *, cover_dir: Path | None = None) -> PsarcP
                 difficulties=len(song.levels),
                 notes=note_count,
                 chords=chord_count,
+                event_count=note_count + chord_count,
+                note_count=playable_count,
             )
         )
         tone_preview = _tone_preview(song, source_path, arr_id, _display_name(arr_id), metadata)
@@ -190,6 +197,21 @@ def inspect_psarc(input_psarc: Path, *, cover_dir: Path | None = None) -> PsarcP
         lyrics=lyric_count,
         warnings=warnings,
     )
+
+
+def _preview_chord_note_count(song: Any, chord_id: int) -> int:
+    try:
+        template = song.chordTemplates[chord_id]
+    except Exception:  # noqa: BLE001
+        return 1
+    count = 0
+    for fret in getattr(template, "frets", []) or []:
+        try:
+            if int(fret) >= 0:
+                count += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return max(1, count)
 
 
 def _tone_preview(

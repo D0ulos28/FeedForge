@@ -1,5 +1,17 @@
 $ErrorActionPreference = "Stop"
 
+function Invoke-FeedForgeNative {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $FilePath,
+        [string[]] $Arguments = @()
+    )
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code $LASTEXITCODE`: $FilePath $($Arguments -join ' ')"
+    }
+}
+
 $SourceRoot = if (Test-Path (Join-Path $PSScriptRoot "pyproject.toml")) {
     $PSScriptRoot
 } else {
@@ -63,25 +75,59 @@ if ($env:FEEDFORGE_PYTHON_EXE -and (Test-Path $env:FEEDFORGE_PYTHON_EXE)) {
 $Marker = Join-Path $InstallRoot ".feedforge-stems-source"
 $SourceStamp = "$SourceRoot|$((Get-Item (Join-Path $SourceRoot "pyproject.toml")).LastWriteTimeUtc.Ticks)|torch=$TorchIndex"
 
+Write-Host "FeedForge: preparing local stem setup"
+Write-Host "FeedForge: install folder $InstallRoot"
+Write-Host "FeedForge: selected model $Model"
+Write-Host "FeedForge: selected device $Device"
+
 if (-not (Test-Path $Python)) {
     if (-not $SystemPython) {
         Write-Error "Python 3.11 or newer was not found. Install Python from https://www.python.org/downloads/windows/ and enable 'Add python.exe to PATH', then start the local stem server again."
         exit 2
     }
     New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+    Write-Host "FeedForge: creating local Python environment"
+    Write-Host "FeedForge: source Python $SystemPython"
     if ((Split-Path -Leaf $SystemPython) -ieq "py.exe") {
-        & $SystemPython -3 -m venv $Venv
+        Invoke-FeedForgeNative $SystemPython @("-3", "-m", "venv", $Venv)
     } else {
-        & $SystemPython -m venv $Venv
+        Invoke-FeedForgeNative $SystemPython @("-m", "venv", $Venv)
     }
+} else {
+    Write-Host "FeedForge: reusing local Python environment"
 }
 
 if (-not (Test-Path $Marker) -or (Get-Content $Marker -Raw -ErrorAction SilentlyContinue) -ne $SourceStamp) {
-    & $Python -m pip install --upgrade pip
-    & $Python -m pip install -e "$SourceRoot[stems]"
+    Write-Host "FeedForge: installing FeedForge stem dependencies"
+    Invoke-FeedForgeNative $Python @("-m", "pip", "install", "--upgrade", "pip")
+    Invoke-FeedForgeNative $Python @("-m", "pip", "install", "-e", "$SourceRoot[stems]")
     if ($TorchIndex) {
-        & $Python -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url $TorchIndex
+        $TorchReady = $false
+        try {
+            Invoke-FeedForgeNative $Python @("-c", "import torch, sys; sys.exit(0 if getattr(torch.version, 'cuda', None) else 1)")
+            $TorchReady = $true
+        } catch {
+            $TorchReady = $false
+        }
+        if ($TorchReady) {
+            Write-Host "FeedForge: CUDA PyTorch runtime already installed"
+        } else {
+            Write-Host "FeedForge: installing CUDA PyTorch runtime"
+            Invoke-FeedForgeNative $Python @("-m", "pip", "install", "--upgrade", "torch", "torchvision", "torchaudio", "--index-url", $TorchIndex)
+        }
     }
     Set-Content -Encoding UTF8 -Path $Marker -Value $SourceStamp
+} else {
+    Write-Host "FeedForge: dependencies already installed"
 }
-& $Python -m feedback_converter.demucs_server --host 127.0.0.1 --port 7865 --model $Model --device $Device --concurrency $Concurrency --preload-model
+Write-Host "FeedForge: verifying Demucs runtime"
+try {
+    Invoke-FeedForgeNative $Python @("-c", "import demucs, fastapi, soundfile, torch")
+} catch {
+    Write-Host "FeedForge: repairing missing stem dependencies"
+    Invoke-FeedForgeNative $Python @("-m", "pip", "install", "-e", "$SourceRoot[stems]")
+    Invoke-FeedForgeNative $Python @("-c", "import demucs, fastapi, soundfile, torch")
+    Set-Content -Encoding UTF8 -Path $Marker -Value $SourceStamp
+}
+Write-Host "FeedForge: starting Demucs server"
+Invoke-FeedForgeNative $Python @("-m", "feedback_converter.demucs_server", "--host", "127.0.0.1", "--port", "7865", "--model", $Model, "--device", $Device, "--concurrency", $Concurrency, "--preload-model")

@@ -197,7 +197,10 @@ def load_demucs_model(model: str = DEFAULT_MODEL, *, device: str = DEFAULT_DEVIC
     cache_key = f"{model}:{resolved_device}"
     demucs_model = _MODEL_CACHE.get(cache_key)
     if demucs_model is None:
-        demucs_model = get_model(model)
+        try:
+            demucs_model = get_model(model)
+        except SystemExit as exc:
+            raise RuntimeError(f"Demucs model preload failed for {model}. Check the setup log for missing runtime dependencies.") from exc
         demucs_model.to(resolved_device)
         demucs_model.eval()
         _MODEL_CACHE[cache_key] = demucs_model

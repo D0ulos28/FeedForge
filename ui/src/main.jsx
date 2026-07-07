@@ -52,12 +52,14 @@ function App() {
   const [demucsDevices, setDemucsDevices] = useState(defaultDemucsDevices());
   const [demucsModels, setDemucsModels] = useState([]);
   const [demucsModelRoot, setDemucsModelRoot] = useState("");
+  const [demucsSetup, setDemucsSetup] = useState(null);
   const [stemServerStatus, setStemServerStatus] = useState({ url: "http://127.0.0.1:7865", running: false, starting: false, healthy: false });
   const [isStartingStemServer, setIsStartingStemServer] = useState(false);
   const [debugLogInfo, setDebugLogInfo] = useState(null);
   const [pythonInfo, setPythonInfo] = useState(null);
   const [isCheckingPython, setIsCheckingPython] = useState(false);
   const [updateInfo, setUpdateInfo] = useState(null);
+  const [appVersion, setAppVersion] = useState("");
   const [rigBuilderDataDir, setRigBuilderDataDir] = useState(() => initialSettingsRef.current.rigBuilderDataDir || "");
   const [conversionWorkers, setConversionWorkers] = useState(DEFAULT_CONVERSION_WORKERS);
   const [query, setQuery] = useState("");
@@ -82,6 +84,25 @@ function App() {
   useEffect(() => {
     writeSettings({ outputDir, lastSourcePath, includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, pythonPath, demucsModel, demucsDevice, demucsStemJobs, rigBuilderDataDir });
   }, [outputDir, lastSourcePath, includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, pythonPath, demucsModel, demucsDevice, demucsStemJobs, rigBuilderDataDir]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadVersion() {
+      try {
+        const version = await api.getAppVersion();
+        if (!cancelled) {
+          setAppVersion(version || "");
+          if (version) document.title = `FeedForge ${version}`;
+        }
+      } catch {
+        if (!cancelled) setAppVersion("");
+      }
+    }
+    loadVersion();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -119,9 +140,9 @@ function App() {
   useEffect(() => {
     if (activeView !== "settings" || settingsSection !== "stems" || !separateStems) return undefined;
     let cancelled = false;
-    async function loadStemPrereqs() {
+    async function loadStemPrereqs(showSpinner = true) {
       try {
-        setIsCheckingPython(true);
+        if (showSpinner) setIsCheckingPython(true);
         const [result, python] = await Promise.all([
           api.getStemServerModels({ installDir: demucsInstallDir }),
           api.getPythonInfo({ installDir: demucsInstallDir, pythonPath }),
@@ -131,20 +152,24 @@ function App() {
         setDemucsDevices(result.devices?.length ? result.devices : defaultDemucsDevices());
         setPythonInfo(python);
         setDemucsModelRoot(result.installRoot || result.defaultInstallDir || "");
+        setDemucsSetup(result.setup || null);
         if (!demucsInstallDir && result.defaultInstallDir) {
           setDemucsInstallDir(result.defaultInstallDir);
         }
       } catch {
         // Model metadata is helpful but not required for conversion.
       } finally {
-        if (!cancelled) setIsCheckingPython(false);
+        if (!cancelled && showSpinner) setIsCheckingPython(false);
       }
     }
     loadStemPrereqs();
+    const shouldTrackSetup = isStartingStemServer || stemServerStatus.processRunning || stemServerStatus.starting || stemServerStatus.phase === "downloading" || stemServerStatus.phase === "installing" || stemServerStatus.phase === "loading";
+    const timer = window.setInterval(() => loadStemPrereqs(false), shouldTrackSetup ? 1500 : 8000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
-  }, [activeView, settingsSection, separateStems, demucsInstallDir, pythonPath]);
+  }, [activeView, settingsSection, separateStems, demucsInstallDir, pythonPath, demucsModel, isStartingStemServer, stemServerStatus.processRunning, stemServerStatus.starting, stemServerStatus.phase]);
 
   useEffect(() => {
     if (!separateStems || activeView !== "settings" || settingsSection !== "stems") return undefined;
@@ -163,12 +188,13 @@ function App() {
       }
     }
     refresh();
-    const timer = window.setInterval(refresh, 5000);
+    const pollMs = (isStartingStemServer || stemServerStatus.starting || stemServerStatus.processRunning) && !stemServerStatus.healthy ? 1000 : 5000;
+    const timer = window.setInterval(refresh, pollMs);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [separateStems, activeView, settingsSection]);
+  }, [separateStems, activeView, settingsSection, isStartingStemServer, stemServerStatus.starting, stemServerStatus.processRunning, stemServerStatus.healthy]);
 
   useEffect(() => {
     return api.onDroppedPaths(async (paths) => {
@@ -218,7 +244,11 @@ function App() {
     converted: items.filter((item) => item.status === "converted").length,
     failed: items.filter((item) => item.status === "failed").length
   }), [items]);
-  const stemServerBusy = (isStartingStemServer || stemServerStatus.starting) && !stemServerStatus.healthy && !stemServerStatus.running;
+  const stemServerBusy = (isStartingStemServer || stemServerStatus.starting || stemServerStatus.processRunning) && !stemServerStatus.healthy;
+  const selectedModel = selectedDemucsModel(demucsModels, demucsModel);
+  const selectedDevice = selectedDemucsDevice(demucsDevices, demucsDevice);
+  const stemServerMatchesSelectedConfig = stemServerMatchesSelection(stemServerStatus, demucsModel, demucsDevice, demucsStemJobs);
+  const stemServerReadyForSelection = stemServerStatus.healthy && stemServerMatchesSelectedConfig;
 
   async function addFiles(paths) {
     const existing = new Set(itemsRef.current.map((item) => normalizePathKey(item.path)));
@@ -336,6 +366,20 @@ function App() {
   async function startLocalStemServer() {
     if (isStartingStemServer) return;
     setIsStartingStemServer(true);
+    setStemServerStatus((current) => ({
+      ...current,
+      running: true,
+      starting: true,
+      healthy: false,
+      phase: "starting",
+      message: "Preparing local stem setup. The first run may download Python packages and the selected Demucs model.",
+      log: [
+        ...(current.log || []).slice(-12),
+        "FeedForge: preparing local stem setup",
+        `FeedForge: selected model ${demucsModel}`,
+        `FeedForge: selected device ${demucsDevice}`
+      ]
+    }));
     try {
       const status = await api.startStemServer({ installDir: demucsInstallDir, pythonPath, model: demucsModel, device: demucsDevice, concurrency: demucsStemJobs });
       setStemServerStatus(status);
@@ -344,6 +388,17 @@ function App() {
       setDemucsModels(result.models || []);
       setDemucsDevices(result.devices?.length ? result.devices : defaultDemucsDevices());
       setDemucsModelRoot(result.installRoot || result.defaultInstallDir || "");
+      setDemucsSetup(result.setup || null);
+    } catch (error) {
+      setStemServerStatus((current) => ({
+        ...current,
+        running: false,
+        starting: false,
+        healthy: false,
+        phase: "error",
+        message: error?.message || "Stem server setup failed. Open the debug log for details.",
+        log: [...(current.log || []).slice(-16), `FeedForge: ${error?.message || "stem setup failed"}`]
+      }));
     } finally {
       setIsStartingStemServer(false);
     }
@@ -470,7 +525,7 @@ function App() {
             <div className="brand">
               <span className="brand-mark">FF</span>
               <div>
-                <strong>FeedForge</strong>
+                <strong>FeedForge {appVersion && <span className="version-badge">v{appVersion}</span>}</strong>
                 <small>FeedBack song toolkit</small>
               </div>
             </div>
@@ -571,7 +626,7 @@ function App() {
                     <h2>Stem splitting</h2>
                     <p>Demucs setup, GPU selection, and split concurrency.</p>
                   </div>
-                  <span className={`server-badge ${stemServerBadge(stemServerStatus, isStartingStemServer).toLowerCase()}`}>{stemServerBadge(stemServerStatus, isStartingStemServer)}</span>
+                  <span className={`server-badge ${stemServerBadge(stemServerStatus, isStartingStemServer, stemServerMatchesSelectedConfig).toLowerCase().replace(/\s+/g, "-")}`}>{stemServerBadge(stemServerStatus, isStartingStemServer, stemServerMatchesSelectedConfig)}</span>
                 </div>
                 {!separateStems ? (
                   <div className="settings-empty">
@@ -583,8 +638,8 @@ function App() {
                 <div className="stem-settings">
                   <div className="stem-summary">
                     <div>
-                      <strong>{stemServerStatus.healthy ? "Ready" : "Setup managed by FeedForge"}</strong>
-                      <span>{stemServerStatus.healthy ? stemServerDetail(stemServerStatus, demucsModel, selectedDemucsModel(demucsModels, demucsModel)) : "FeedForge creates a local Python environment, installs Demucs/PyTorch, downloads the selected model, and reuses it later."}</span>
+                      <strong>{stemServerReadyForSelection ? "Ready" : "Setup managed by FeedForge"}</strong>
+                      <span>{stemServerReadyForSelection ? stemServerDetail(stemServerStatus, demucsModel, selectedModel) : "FeedForge creates a local Python environment, installs Demucs/PyTorch, downloads the selected model, and reuses it later."}</span>
                     </div>
                   </div>
                   <div className={`stem-prereq ${pythonInfo?.ok ? "ready" : pythonInfo?.found === false ? "missing" : ""}`}>
@@ -610,20 +665,33 @@ function App() {
                   </label>
                   <label>
                     Model
-                    <select value={demucsModel} onChange={(event) => setDemucsModel(event.target.value)} disabled={isConverting || stemServerStatus.processRunning || stemServerBusy}>
+                    <select value={demucsModel} onChange={(event) => setDemucsModel(event.target.value)} disabled={isConverting || stemServerBusy}>
                       {(demucsModels.length ? demucsModels : [{ id: "htdemucs_6s", name: "HTDemucs 6-source", size: "approx. 270 MB", description: "Best FeedForge default." }]).map((model) => (
                         <option key={model.id} value={model.id}>{model.name} ({model.size}) - {modelStatusLabel(model)}</option>
                       ))}
                     </select>
                   </label>
                   <div className="demucs-model-note">
-                    <strong>{modelStatusLabel(selectedDemucsModel(demucsModels, demucsModel))} - {selectedDemucsModel(demucsModels, demucsModel)?.size || "Model size varies"}</strong>
-                    <span>{selectedDemucsModel(demucsModels, demucsModel)?.description || "The selected model downloads on first local server start."}</span>
-                    <em>{selectedDemucsModel(demucsModels, demucsModel)?.installed ? "Starting this model should reuse the local checkpoint." : `Cache checked in ${demucsModelRoot || "the selected install folder"} and the legacy Torch cache.`}</em>
+                    <strong>{modelStatusLabel(selectedModel)} - {selectedModel?.size || "Model size varies"}</strong>
+                    <span>{selectedModel?.installed ? "This model is already cached locally." : "This model will download the first time you start it or run a stem conversion with it selected."}</span>
+                    <em>{selectedModel?.description || "The selected model downloads on first local server start."}</em>
+                    {!selectedModel?.installed && (
+                      <button onClick={startLocalStemServer} disabled={isConverting || stemServerBusy || pythonInfo?.ok === false}>
+                        {stemServerBusy ? <RotateCw className="spin" size={16} /> : <Download size={16} />}
+                        Download/start this model
+                      </button>
+                    )}
                   </div>
+                  <StemSetupChecklist
+                    pythonInfo={pythonInfo}
+                    setup={demucsSetup}
+                    selectedModel={selectedModel}
+                    status={stemServerStatus}
+                    matchesSelection={stemServerMatchesSelectedConfig}
+                  />
                   <label>
                     Processing device
-                    <select value={demucsDevice} onChange={(event) => setDemucsDevice(event.target.value)} disabled={isConverting || stemServerStatus.processRunning || stemServerBusy}>
+                    <select value={demucsDevice} onChange={(event) => setDemucsDevice(event.target.value)} disabled={isConverting || stemServerBusy}>
                       {demucsDevices.map((device) => (
                         <option key={device.id} value={device.id} disabled={device.available === false}>
                           {deviceLabel(device)}
@@ -632,25 +700,25 @@ function App() {
                     </select>
                   </label>
                   <div className="demucs-device-note">
-                    <strong>{stemServerStatus.healthy ? `Active: ${resolvedDeviceLabel(stemServerStatus)}` : `Selected: ${selectedDemucsDevice(demucsDevices, demucsDevice)?.name || demucsDevice}`}</strong>
-                    <span>{deviceHelpText(selectedDemucsDevice(demucsDevices, demucsDevice), stemServerStatus)}</span>
+                    <strong>{stemServerReadyForSelection ? `Active: ${resolvedDeviceLabel(stemServerStatus)}` : `Selected: ${selectedDevice?.name || demucsDevice}`}</strong>
+                    <span>{deviceHelpText(selectedDevice, stemServerStatus)}</span>
                   </div>
                   <label>
                     Stem jobs
-                    <select value={demucsStemJobs} onChange={(event) => setDemucsStemJobs(Number(event.target.value))} disabled={isConverting || stemServerStatus.processRunning || stemServerBusy}>
+                    <select value={demucsStemJobs} onChange={(event) => setDemucsStemJobs(Number(event.target.value))} disabled={isConverting || stemServerBusy}>
                       {[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}
                     </select>
                   </label>
                   <div className="demucs-device-note">
-                    <strong>{stemServerStatus.healthy ? `Server allows ${stemServerStatus.concurrency || 1} stem job${Number(stemServerStatus.concurrency || 1) === 1 ? "" : "s"}` : `Selected: ${demucsStemJobs} stem job${demucsStemJobs === 1 ? "" : "s"}`}</strong>
+                    <strong>{stemServerReadyForSelection ? `Server allows ${stemServerStatus.concurrency || 1} stem job${Number(stemServerStatus.concurrency || 1) === 1 ? "" : "s"}` : `Selected: ${demucsStemJobs} stem job${demucsStemJobs === 1 ? "" : "s"}`}</strong>
                     <span>{stemJobHelpText(demucsStemJobs, stemServerStatus)}</span>
                   </div>
                   <div className="demucs-install-row">
                     <label>
                       Install folder
-                      <input value={demucsInstallDir} onChange={(event) => setDemucsInstallDir(event.target.value)} placeholder="Choose where Demucs, caches, and models are stored" disabled={isConverting || stemServerStatus.processRunning || stemServerBusy} />
+                      <input value={demucsInstallDir} onChange={(event) => setDemucsInstallDir(event.target.value)} placeholder="Choose where Demucs, caches, and models are stored" disabled={isConverting || stemServerBusy} />
                     </label>
-                    <button onClick={chooseDemucsInstallDir} disabled={isConverting || stemServerStatus.processRunning || stemServerBusy}>
+                    <button onClick={chooseDemucsInstallDir} disabled={isConverting || stemServerBusy}>
                       <FolderOpen size={17} />
                       Browse
                     </button>
@@ -664,18 +732,18 @@ function App() {
                     <input value={demucsApiKey} onChange={(event) => setDemucsApiKey(event.target.value)} placeholder="Optional" type="password" disabled={isConverting} />
                   </label>
                   <div className="local-stem-server">
-                    <div className={`server-state ${stemServerStatus.healthy ? "ready" : stemServerBusy ? "starting" : stemServerStatus.phase === "error" ? "error" : ""}`}>
+                    <div className={`server-state ${stemServerReadyForSelection ? "ready" : stemServerStatus.healthy ? "changed" : stemServerBusy ? "starting" : stemServerStatus.phase === "error" ? "error" : ""}`}>
                       <Server size={17} />
                       <div>
-                        <strong>{stemServerTitle(stemServerStatus, stemServerBusy)}</strong>
-                        <span>{stemServerDetail(stemServerStatus, demucsModel, selectedDemucsModel(demucsModels, demucsModel))}</span>
+                        <strong>{stemServerTitle(stemServerStatus, stemServerBusy, stemServerMatchesSelectedConfig)}</strong>
+                        <span>{stemServerDetail(stemServerStatus, demucsModel, selectedModel, stemServerMatchesSelectedConfig)}</span>
                       </div>
                     </div>
                     <div className="server-actions">
-                      {!stemServerStatus.healthy && (
+                      {!stemServerReadyForSelection && (
                         <button onClick={startLocalStemServer} disabled={isConverting || stemServerBusy || pythonInfo?.ok === false}>
                           {stemServerBusy ? <RotateCw className="spin" size={17} /> : <Download size={17} />}
-                          {stemServerStatus.running ? "Restart local stem server" : "Install/start local stem server"}
+                          {stemServerActionText(stemServerStatus, stemServerBusy, selectedModel)}
                         </button>
                       )}
                       {(stemServerStatus.processRunning || stemServerBusy) && (
@@ -686,6 +754,13 @@ function App() {
                       )}
                     </div>
                   </div>
+                  {(stemServerBusy || stemServerStatus.phase === "error" || (stemServerStatus.log || []).length > 0) && (
+                    <StemSetupProgress
+                      status={stemServerStatus}
+                      busy={stemServerBusy}
+                      debugLogInfo={debugLogInfo}
+                    />
+                  )}
                 </div>
                 )}
               </div>
@@ -767,14 +842,16 @@ function App() {
   );
 }
 
-function stemServerBadge(status, isStarting) {
-  if (status.healthy) return "Running";
-  if (status.starting || isStarting) return "Starting";
+function stemServerBadge(status, isStarting, matchesSelection = true) {
+  if (status.healthy && matchesSelection) return "Running";
+  if (status.healthy && !matchesSelection) return "Config changed";
+  if (status.starting || status.processRunning || isStarting) return "Starting";
   if (status.running) return "Unhealthy";
   return "Stopped";
 }
 
-function stemServerTitle(status, busy) {
+function stemServerTitle(status, busy, matchesSelection = true) {
+  if (status.healthy && !matchesSelection) return "Selected stem setup is not active";
   if (status.healthy) return "Local stem server ready";
   if (status.phase === "downloading") return "Downloading runtime";
   if (status.phase === "installing") return "Installing runtime";
@@ -785,7 +862,67 @@ function stemServerTitle(status, busy) {
   return "Local stem server not running";
 }
 
-function stemServerDetail(status, demucsModel, selectedModel) {
+function stemServerActionText(status, busy, selectedModel = null) {
+  if (!busy) {
+    if (status.healthy) return selectedModel?.installed ? "Apply selected model" : "Download/start selected model";
+    return status.running ? "Restart local stem server" : "Install/start local stem server";
+  }
+  if (status.phase === "downloading") return "Downloading...";
+  if (status.phase === "installing") return "Installing...";
+  if (status.phase === "loading") return "Loading model...";
+  return "Starting...";
+}
+
+function stemPhasePercent(status) {
+  if (status.healthy || status.phase === "ready") return 100;
+  if (status.phase === "loading") return 78;
+  if (status.phase === "installing") return 50;
+  if (status.phase === "downloading") return 30;
+  if (status.phase === "starting") return 14;
+  if (status.phase === "error") return 100;
+  return 0;
+}
+
+function stemPhaseLabel(status, busy) {
+  if (status.healthy) return "Ready";
+  if (status.phase === "error") return "Error";
+  if (status.phase === "downloading") return "Downloading";
+  if (status.phase === "installing") return "Installing";
+  if (status.phase === "loading") return "Loading";
+  if (busy || status.starting) return "Starting";
+  return "Idle";
+}
+
+function StemSetupProgress({ status, busy, debugLogInfo }) {
+  const percent = stemPhasePercent(status);
+  const latestLog = (status.log || []).slice(-8);
+  return (
+    <div className={`stem-progress ${status.phase === "error" ? "error" : status.healthy ? "ready" : busy ? "active" : ""}`}>
+      <div className="stem-progress-head">
+        <div>
+          <strong>{stemPhaseLabel(status, busy)}</strong>
+          <span>{stemServerDetail(status)}</span>
+        </div>
+        <div className="stem-progress-actions">
+          <button className="ghost" onClick={() => api.openDebugLog()} disabled={!debugLogInfo?.path}>Open log</button>
+          <button className="ghost" onClick={() => api.openDebugLogFolder()} disabled={!debugLogInfo?.folder}>Open folder</button>
+        </div>
+      </div>
+      <div className="progress-track" aria-hidden="true">
+        <span style={{ width: `${percent}%` }} />
+      </div>
+      <div className="stem-progress-log">
+        {latestLog.length ? latestLog.map((line, index) => <code key={`${line}-${index}`}>{line}</code>) : <span>Waiting for setup output...</span>}
+      </div>
+    </div>
+  );
+}
+
+function stemServerDetail(status, demucsModel, selectedModel, matchesSelection = true) {
+  if (status.healthy && !matchesSelection) {
+    const selected = selectedModel?.name || demucsModel;
+    return `Current server is ${status.model || "another model"}. Start the selected setup to use ${selected}.`;
+  }
   if (status.healthy) {
     return `${status.url} - ${status.model || demucsModel} on ${resolvedDeviceLabel(status)} is ready for conversions.`;
   }
@@ -793,6 +930,55 @@ function stemServerDetail(status, demucsModel, selectedModel) {
   if (status.running) return "The port is reachable, but health did not pass. Open the debug log if this stays unresolved.";
   if (selectedModel?.installed) return "Selected model is installed. Starting this model should reuse the local checkpoint.";
   return "First start downloads Python dependencies and the selected model into the install folder.";
+}
+
+function stemServerMatchesSelection(status, model, device, jobs) {
+  if (!status?.healthy) return false;
+  const modelMatches = !status.model || status.model === model;
+  const requestedDevice = status.requestedDevice || status.device || "";
+  const deviceMatches = !requestedDevice || requestedDevice === device || (device === "auto" && requestedDevice === "auto");
+  const jobMatches = !status.concurrency || Number(status.concurrency) === Number(jobs || 1);
+  return modelMatches && deviceMatches && jobMatches;
+}
+
+function StemSetupChecklist({ pythonInfo, setup, selectedModel, status, matchesSelection }) {
+  const rows = [
+    {
+      label: "Python",
+      state: pythonInfo?.ok ? "ready" : pythonInfo?.found === false ? "missing" : "pending",
+      text: pythonInfo?.ok ? `Ready ${pythonInfo.version || ""}` : "Python 3.11+ required"
+    },
+    {
+      label: "Local environment",
+      state: setup?.environmentInstalled ? "ready" : "missing",
+      text: setup?.environmentInstalled ? "Created" : "Created on first start"
+    },
+    {
+      label: "Dependencies",
+      state: setup?.dependenciesInstalled ? "ready" : "missing",
+      text: setup?.dependenciesInstalled ? "Installed" : "Installed on first start"
+    },
+    {
+      label: "Selected model",
+      state: selectedModel?.installed ? "ready" : selectedModel?.partial ? "pending" : "missing",
+      text: selectedModel?.installed ? "Downloaded" : selectedModel?.partial ? "Partially downloaded" : "Download needed"
+    },
+    {
+      label: "Active server",
+      state: status?.healthy && matchesSelection ? "ready" : status?.healthy ? "pending" : "missing",
+      text: status?.healthy && matchesSelection ? "Matches selection" : status?.healthy ? `Running ${status.model || "another model"}` : "Not running"
+    }
+  ];
+  return (
+    <div className="setup-checklist">
+      {rows.map((row) => (
+        <div key={row.label} className={`setup-check ${row.state}`}>
+          <span>{row.label}</span>
+          <strong>{row.text}</strong>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function pythonPrereqTitle(info, checking) {

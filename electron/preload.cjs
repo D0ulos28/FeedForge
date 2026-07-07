@@ -56,6 +56,7 @@ contextBridge.exposeInMainWorld("feedbackConverter", {
   getStemServerModels: (options) => ipcRenderer.invoke("stemServer:models", options),
   startStemServer: (options) => ipcRenderer.invoke("stemServer:start", options),
   stopStemServer: () => ipcRenderer.invoke("stemServer:stop"),
+  getAppVersion: () => ipcRenderer.invoke("app:version"),
   getDebugLogInfo: () => ipcRenderer.invoke("app:debugLogInfo"),
   openDebugLog: () => ipcRenderer.invoke("app:openDebugLog"),
   openDebugLogFolder: () => ipcRenderer.invoke("app:openDebugLogFolder"),

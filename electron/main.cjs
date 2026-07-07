@@ -59,20 +59,6 @@ const DEMUCS_MODELS = [
     size: "approx. 150 MB",
     description: "MDX model trained with extra data. Can outperform HTDemucs on some mixes, but still 4-source only.",
     signatures: ["e51eebcc", "a1d90b5c", "5d2d6c55", "c5cba043"]
-  },
-  {
-    id: "mdx_q",
-    name: "MDX Q",
-    size: "approx. 40 MB",
-    description: "Quantized MDX model. Smaller download and often faster, with lower separation quality.",
-    signatures: ["6b9c2ca1", "b72baf4e", "42e558d4", "305bc58f"]
-  },
-  {
-    id: "mdx_extra_q",
-    name: "MDX Extra Q",
-    size: "approx. 40 MB",
-    description: "Quantized MDX Extra. Smaller and faster than MDX Extra, usually lower quality than full-size models.",
-    signatures: ["83fc094f", "464b36d7", "14fc6a69", "7fd6ef75"]
   }
 ];
 
@@ -83,7 +69,7 @@ function createWindow() {
     minWidth: 1180,
     minHeight: 760,
     backgroundColor: "#090f18",
-    title: "FeedForge",
+    title: `FeedForge ${app.getVersion()}`,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -340,6 +326,7 @@ ipcMain.handle("stemServer:models", async (_event, options = {}) => {
   return {
     defaultInstallDir: defaultDemucsInstallRoot(),
     installRoot,
+    setup: await demucsSetupState(installRoot),
     devices: await demucsDeviceOptions(installRoot),
     models: modelInstallStates(installRoot)
   };
@@ -350,9 +337,11 @@ ipcMain.handle("stemServer:start", async (_event, options = {}) => {
 });
 
 ipcMain.handle("stemServer:stop", async () => {
-  stopStemServer();
+  await stopStemServer({ forcePort: true });
   return stemServerStatus();
 });
+
+ipcMain.handle("app:version", async () => app.getVersion());
 
 ipcMain.handle("app:debugLogInfo", async () => {
   return debugLogInfo();
@@ -539,8 +528,26 @@ async function startStemServer(options = {}) {
   const torchIndex = demucsTorchIndex(device);
   const existing = await stemServerStatus();
   if (existing.running || stemServerStarting) {
-    if (existing.processRunning && (existing.installRoot !== installRoot || existing.model !== model || existing.requestedDevice !== device || existing.concurrency !== concurrency)) {
-      stopStemServer();
+    const configChanged = existing.installRoot !== installRoot || existing.model !== model || existing.requestedDevice !== device || Number(existing.concurrency || 1) !== concurrency;
+    if (existing.processRunning && configChanged) {
+      await stopStemServer({ forcePort: true });
+      await waitForStemServerStop(4500);
+    } else if (existing.running && configChanged) {
+      appendStemServerLog(`FeedForge: stopping current stem server model=${existing.model || "unknown"}`);
+      await stopStemServer({ forcePort: true });
+      const stopped = await waitForStemServerStop(4500);
+      if (!stopped) {
+        return stemServerState({
+          ok: false,
+          running: true,
+          healthy: false,
+          installRoot,
+          model: existing.model || null,
+          requestedDevice: existing.requestedDevice || null,
+          concurrency: existing.concurrency || null,
+          error: `Could not stop the current stem server on ${LOCAL_STEM_SERVER_URL}. Open Diagnostics, stop it, then start ${model} again.`
+        });
+      }
     } else {
       return { ...existing, starting: stemServerStarting, url: LOCAL_STEM_SERVER_URL };
     }
@@ -561,6 +568,10 @@ async function startStemServer(options = {}) {
   stemServerLog = [];
   fs.mkdirSync(installRoot, { recursive: true });
   logDebug("stemServer.start", { scriptPath, installRoot, model, device, concurrency, torchIndex, hasPythonOverride: Boolean(pythonExe) });
+  appendStemServerLog(`FeedForge: preparing local stem setup`);
+  appendStemServerLog(`FeedForge: model=${model}, device=${device}, jobs=${concurrency}`);
+  appendStemServerLog(`FeedForge: install folder ${installRoot}`);
+  if (pythonExe) appendStemServerLog(`FeedForge: using selected Python ${pythonExe}`);
 
   stemServerProcess = spawn("powershell.exe", [
     "-NoProfile",
@@ -627,14 +638,14 @@ async function stemServerStatus() {
   });
 }
 
-function stopStemServer() {
-  if (!stemServerProcess) return;
+async function stopStemServer(options = {}) {
+  if (!stemServerProcess && !options.forcePort) return;
   logDebug("stemServer.stop");
-  const pid = stemServerProcess.pid;
+  const pid = stemServerProcess?.pid;
   try {
-    if (process.platform === "win32" && pid) {
+    if (stemServerProcess && process.platform === "win32" && pid) {
       spawn("taskkill.exe", ["/pid", String(pid), "/T", "/F"], { windowsHide: true });
-    } else {
+    } else if (stemServerProcess) {
       stemServerProcess.kill();
     }
   } catch (error) {
@@ -642,13 +653,47 @@ function stopStemServer() {
   }
   stemServerProcess = null;
   stemServerStarting = false;
+  if (options.forcePort) {
+    await stopLocalStemServerPort();
+  }
+}
+
+async function stopLocalStemServerPort() {
+  if (process.platform !== "win32") return;
+  const result = await runProcess("netstat.exe", ["-ano", "-p", "TCP"], { timeoutMs: 7000 });
+  if (result.code !== 0 || !result.stdout) return;
+  const pids = new Set();
+  for (const line of result.stdout.split(/\r?\n/)) {
+    if (!/\sLISTENING\s/i.test(line)) continue;
+    if (!/(?:127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\[::\]):7865\b/i.test(line)) continue;
+    const match = line.trim().match(/\s(\d+)$/);
+    if (match?.[1]) pids.add(match[1]);
+  }
+  for (const listenPid of pids) {
+    try {
+      await runProcess("taskkill.exe", ["/pid", listenPid, "/T", "/F"], { timeoutMs: 7000 });
+      appendStemServerLog(`FeedForge: stopped old stem server process ${listenPid}`);
+    } catch (error) {
+      logDebug("stemServer.portStop.failed", { pid: listenPid, ...errorToLog(error) });
+    }
+  }
+}
+
+async function waitForStemServerStop(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const health = await requestJson(`${LOCAL_STEM_SERVER_URL}/health`, 500);
+    if (!health.body) return true;
+    await delay(350);
+  }
+  return false;
 }
 
 function stemServerState(extra = {}) {
   const processRunning = Boolean(stemServerProcess && stemServerProcess.exitCode === null);
   const running = Boolean(extra.running || processRunning);
   const healthy = Boolean(extra.healthy);
-  const progress = stemServerProgress(extra, healthy, running);
+  const progress = stemServerProgress(extra, healthy, running, processRunning);
   return {
     ...extra,
     ok: Boolean(extra.ok),
@@ -670,7 +715,7 @@ function stemServerState(extra = {}) {
   };
 }
 
-function stemServerProgress(extra, healthy, running) {
+function stemServerProgress(extra, healthy, running, processRunning) {
   if (healthy) {
     return {
       phase: "ready",
@@ -679,7 +724,7 @@ function stemServerProgress(extra, healthy, running) {
   }
   const lines = stemServerLog.slice(-30);
   const text = lines.join("\n");
-  const lastImportant = [...lines].reverse().find((line) => /error|traceback|successfully installed|installing collected|using cached|downloading|collecting|uvicorn|running/i.test(line)) || "";
+  const lastImportant = [...lines].reverse().find((line) => /error|traceback|feedforge:|successfully installed|installing collected|using cached|downloading|collecting|uvicorn|running/i.test(line)) || "";
   if (/traceback|error:/i.test(text)) {
     return {
       phase: "error",
@@ -690,6 +735,36 @@ function stemServerProgress(extra, healthy, running) {
     return {
       phase: "loading",
       message: "CUDA/Python packages installed. Loading Demucs and starting the local server."
+    };
+  }
+  if (/feedforge: starting demucs server/i.test(text)) {
+    return {
+      phase: "loading",
+      message: "Starting Demucs and preloading the selected model. First model load can take a while."
+    };
+  }
+  if (/feedforge: installing cuda pytorch|feedforge: installing pytorch/i.test(text)) {
+    return {
+      phase: "installing",
+      message: "Installing the PyTorch runtime for the selected device."
+    };
+  }
+  if (/feedforge: installing feedforge stem dependencies/i.test(text)) {
+    return {
+      phase: "installing",
+      message: "Installing FeedForge stem dependencies into the local environment."
+    };
+  }
+  if (/feedforge: creating local python environment/i.test(text)) {
+    return {
+      phase: "installing",
+      message: "Creating the local Python environment for stem splitting."
+    };
+  }
+  if (/feedforge: preparing/i.test(text)) {
+    return {
+      phase: "starting",
+      message: "Preparing local stem setup."
     };
   }
   if (/installing collected packages/i.test(text)) {
@@ -757,6 +832,10 @@ function demucsConcurrency(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 1;
   return Math.max(1, Math.min(Math.trunc(parsed), 4));
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function demucsDeviceOptions(installRoot) {
@@ -912,6 +991,25 @@ function modelInstallStates(installRoot) {
       requiredCount: signatures.length
     };
   });
+}
+
+async function demucsSetupState(installRoot) {
+  const venvPython = path.join(installRoot, ".demucs-venv", "Scripts", "python.exe");
+  const marker = path.join(installRoot, ".feedforge-stems-source");
+  const checkpointFiles = checkpointFileNames(installRoot);
+  const environmentInstalled = fs.existsSync(venvPython);
+  return {
+    installRoot,
+    venvPython,
+    environmentInstalled,
+    dependenciesInstalled: fs.existsSync(marker),
+    marker,
+    checkpointCount: checkpointFiles.length,
+    cacheRoots: [
+      path.join(installRoot, "model-cache", "torch", "hub", "checkpoints"),
+      path.join(osHome(), ".cache", "torch", "hub", "checkpoints")
+    ]
+  };
 }
 
 function checkpointFileNames(installRoot) {

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .converter import ConversionResult, convert_psarc
+from .inspector import inspect_psarc
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,9 @@ def convert_many(
     input_paths: list[Path],
     output_dir: Path | None = None,
     *,
+    output_layout: str = "flat",
+    name_template: str = "{source}",
+    source_root: Path | None = None,
     archive: bool = True,
     overwrite: bool = False,
     keep_workdir: bool = False,
@@ -51,10 +57,16 @@ def convert_many(
 ) -> BatchResult:
     """Convert multiple PSARC files, returning per-file success/error state."""
     items: list[BatchItem] = []
-    for input_path in [Path(path) for path in input_paths]:
-        output = None
-        if output_dir is not None:
-            output = Path(output_dir) / input_path.with_suffix(".feedpak").name
+    normalized_inputs = [Path(path) for path in input_paths]
+    resolved_source_root = Path(source_root) if source_root is not None else _common_parent(normalized_inputs)
+    for input_path in normalized_inputs:
+        output = _batch_output_path(
+            input_path,
+            Path(output_dir) if output_dir is not None else None,
+            output_layout,
+            resolved_source_root,
+            name_template,
+        )
         try:
             result = convert_psarc(
                 input_path,
@@ -75,6 +87,84 @@ def convert_many(
         else:
             items.append(BatchItem(input_path=input_path, result=result))
     return BatchResult(items=items)
+
+
+def _batch_output_path(
+    input_path: Path,
+    output_dir: Path | None,
+    output_layout: str,
+    source_root: Path | None,
+    name_template: str = "{source}",
+) -> Path | None:
+    if output_dir is None:
+        return None
+    lowered_template = str(name_template or "").lower()
+    needs_metadata = (
+        "{artist}" in lowered_template
+        or "{title}" in lowered_template
+        or "{album}" in lowered_template
+        or "{year}" in lowered_template
+        or str(output_layout or "").strip().lower() == "artist"
+    )
+    metadata = _output_name_metadata(input_path, needs_metadata=needs_metadata)
+    file_name = f"{_safe_path_segment(_render_name_template(name_template, metadata), metadata['source'])}.feedpak"
+    layout = str(output_layout or "flat").strip().lower()
+    if layout == "preserve":
+        try:
+            relative_parent = input_path.parent.resolve().relative_to(Path(source_root).resolve()) if source_root else Path()
+        except ValueError:
+            relative_parent = Path()
+        return output_dir / relative_parent / file_name
+    if layout == "artist":
+        return output_dir / _safe_path_segment(metadata["artist"]) / file_name
+    return output_dir / file_name
+
+
+def _common_parent(paths: list[Path]) -> Path | None:
+    if not paths:
+        return None
+    try:
+        return Path(os.path.commonpath([str(path.parent.resolve()) for path in paths]))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _output_name_metadata(input_path: Path, *, needs_metadata: bool) -> dict[str, str]:
+    source = input_path.stem
+    metadata = {
+        "source": source,
+        "artist": "Unknown Artist",
+        "title": source,
+        "album": "",
+        "year": "",
+    }
+    if not needs_metadata:
+        return metadata
+    try:
+        preview = inspect_psarc(input_path)
+    except Exception:  # noqa: BLE001
+        return metadata
+    metadata["artist"] = str(getattr(preview, "artist", None) or metadata["artist"])
+    metadata["title"] = str(getattr(preview, "title", None) or metadata["title"])
+    metadata["album"] = str(getattr(preview, "album", None) or "")
+    metadata["year"] = str(getattr(preview, "year", None) or "")
+    return metadata
+
+
+def _render_name_template(template: str, metadata: dict[str, str]) -> str:
+    allowed = {"artist", "title", "album", "year", "source"}
+
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1).lower()
+        return metadata.get(key, "") if key in allowed else match.group(0)
+
+    return re.sub(r"\{(artist|title|album|year|source)\}", replace, str(template or "{source}"), flags=re.IGNORECASE)
+
+
+def _safe_path_segment(value: str, fallback: str = "Unknown Artist") -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", str(value or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(". ")
+    return cleaned or fallback
 
 
 def _cleanup_failed_workdir(

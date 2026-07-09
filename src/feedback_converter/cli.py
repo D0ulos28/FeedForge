@@ -13,10 +13,11 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from feedback_converter import __version__
-from feedback_converter.batch import convert_many
+from feedback_converter.batch import _batch_output_path, convert_many
 from feedback_converter.converter import convert_psarc, convert_psarc_songs
 from feedback_converter.inspector import inspect_psarc
 from feedback_converter.rig_builder_seed import seed_rig_builder_routes
+from feedback_converter.tone_lab import run_tone_lab
 
 
 def _jsonable(value: Any) -> Any:
@@ -64,6 +65,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Overwrite an existing output path.",
+    )
+    parser.add_argument(
+        "--output-layout",
+        choices=["flat", "preserve", "artist"],
+        default="flat",
+        help="Batch output folder layout: flat, preserve source folders, or sort by artist metadata.",
+    )
+    parser.add_argument(
+        "--source-root",
+        help="Source folder root used with --output-layout preserve.",
+    )
+    parser.add_argument(
+        "--name-template",
+        default="{source}",
+        help="Output filename template. Available fields: {artist}, {title}, {album}, {year}, {source}.",
     )
     parser.add_argument(
         "--keep-workdir",
@@ -116,6 +132,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--rig-builder-data-dir",
         help="FeedBack Rig Builder data folder, or a portable FeedBack folder containing it.",
     )
+    parser.add_argument(
+        "--tone-lab",
+        action="store_true",
+        help="Run automated tone QA: convert, seed Rig Builder, generate dry DI fixtures, and write reports.",
+    )
+    parser.add_argument(
+        "--tone-lab-output",
+        help="Folder for --tone-lab evidence reports, fixtures, and converted FeedPak output.",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -125,6 +150,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.rig_builder_data_dir:
         os.environ["FEEDFORGE_RIG_BUILDER_DATA_DIR"] = args.rig_builder_data_dir
+
+    if args.tone_lab:
+        if len(args.input) != 1:
+            parser.error("--tone-lab requires exactly one input")
+        try:
+            result = run_tone_lab(
+                Path(args.input[0]),
+                output_dir=Path(args.tone_lab_output) if args.tone_lab_output else None,
+                rig_builder_data_dir=Path(args.rig_builder_data_dir) if args.rig_builder_data_dir else None,
+                overwrite=args.overwrite,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stdout)
+            return 1
+        print(json.dumps({"ok": True, "result": _jsonable(result)}, ensure_ascii=False), file=sys.stdout)
+        return 0
 
     if args.inspect_json:
         if len(args.input) != 1:
@@ -158,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--output must be a folder when converting multiple inputs")
 
     if len(input_paths) == 1:
-        output_path = _single_output_path(input_paths[0], output_arg)
+        output_path = _single_output_path(input_paths[0], output_arg, args.name_template)
         try:
             results = convert_psarc_songs(
                 input_paths[0],
@@ -187,6 +228,9 @@ def main(argv: list[str] | None = None) -> int:
     batch = convert_many(
         input_paths,
         output_arg,
+        output_layout=args.output_layout,
+        name_template=args.name_template,
+        source_root=Path(args.source_root) if args.source_root else None,
         archive=not args.directory,
         overwrite=args.overwrite,
         keep_workdir=args.keep_workdir,
@@ -207,13 +251,13 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if batch.ok else 1
 
 
-def _single_output_path(input_path: Path, output_arg: Path | None) -> Path | None:
+def _single_output_path(input_path: Path, output_arg: Path | None, name_template: str = "{source}") -> Path | None:
     if output_arg is None:
         return None
     if output_arg.exists() and output_arg.is_dir():
-        return output_arg / input_path.with_suffix(".feedpak").name
+        return _batch_output_path(input_path, output_arg, "flat", None, name_template)
     if not output_arg.suffix:
-        return output_arg / input_path.with_suffix(".feedpak").name
+        return _batch_output_path(input_path, output_arg, "flat", None, name_template)
     return output_arg
 
 

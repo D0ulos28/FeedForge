@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feedforge"
-version = "0.1.8"
+version = "0.1.9"
 description = "Convert PSARC CDLC packages to FeedPak packages."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,7 +36,7 @@ feedforge-demucs-server = "feedback_converter.demucs_server:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-feedback_converter = ["tools/*"]
+feedback_converter = ["tools/*", "data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

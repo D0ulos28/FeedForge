@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import base64
+import math
 import sqlite3
 import subprocess
 import sys
+import wave
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,8 +15,10 @@ import yaml
 import pytest
 
 from feedback_converter import converter
+from feedback_converter import batch
 from feedback_converter import inspector
 from feedback_converter import rig_builder_seed
+from feedback_converter import tone_lab
 from feedback_converter.cli import _single_output_path
 from feedback_converter.psarc_format import crypto
 from feedback_converter.psarc_format.psarc import read_entry
@@ -240,6 +245,7 @@ def test_convert_psarc_writes_valid_feedpak_directory(tmp_path, monkeypatch):
     rigs = json.loads((output / "rigs.json").read_text(encoding="utf-8"))
     assert [rig["name"] for rig in rigs["rigs"]] == ["Clean", "Drive"]
     assert rigs["rigs"][0]["blocks"][0]["role"] == "amp"
+    assert rigs["rigs"][0]["blocks"][0]["name"] == "Amp_Clean"
     assert rigs["rigs"][0]["blocks"][0]["params"]["Gain"] == 0.2
     assert rigs["rigs"][0]["blocks"][1]["role"] == "cab"
     assert rigs["rigs"][1]["blocks"][0]["role"] == "drive"
@@ -450,6 +456,76 @@ def test_single_cli_explicit_output_file_is_preserved(tmp_path):
     assert _single_output_path(input_path, output_file) == output_file
 
 
+def test_batch_output_layout_preserves_source_folders(tmp_path):
+    source = tmp_path / "source"
+    input_path = source / "Artist" / "Song.psarc"
+    input_path.parent.mkdir(parents=True)
+    input_path.write_bytes(b"fake")
+    output_dir = tmp_path / "out"
+
+    assert batch._batch_output_path(input_path, output_dir, "preserve", source) == output_dir / "Artist" / "Song.feedpak"
+
+
+def test_batch_output_layout_sanitizes_artist_folder(tmp_path, monkeypatch):
+    input_path = tmp_path / "Song.psarc"
+    input_path.write_bytes(b"fake")
+    output_dir = tmp_path / "out"
+    monkeypatch.setattr(batch, "inspect_psarc", lambda _path: SimpleNamespace(artist='AC/DC: Live?'))
+
+    assert batch._batch_output_path(input_path, output_dir, "artist", None) == output_dir / "AC_DC_ Live_" / "Song.feedpak"
+
+
+def test_batch_output_name_template_uses_metadata(tmp_path, monkeypatch):
+    input_path = tmp_path / "Song.psarc"
+    input_path.write_bytes(b"fake")
+    output_dir = tmp_path / "out"
+    monkeypatch.setattr(
+        batch,
+        "inspect_psarc",
+        lambda _path: SimpleNamespace(artist="Foo Fighters", title="My Hero", album="The Colour and the Shape", year=1997),
+    )
+
+    assert (
+        batch._batch_output_path(input_path, output_dir, "flat", None, "{artist} - {title}")
+        == output_dir / "Foo Fighters - My Hero.feedpak"
+    )
+
+
+def test_batch_output_name_template_sanitizes_filename(tmp_path, monkeypatch):
+    input_path = tmp_path / "Song.psarc"
+    input_path.write_bytes(b"fake")
+    output_dir = tmp_path / "out"
+    monkeypatch.setattr(batch, "inspect_psarc", lambda _path: SimpleNamespace(artist="AC/DC", title="Live: One?"))
+
+    assert (
+        batch._batch_output_path(input_path, output_dir, "flat", None, "{title} - {artist}")
+        == output_dir / "Live_ One_ - AC_DC.feedpak"
+    )
+
+
+def test_tone_rig_blocks_follow_rig_builder_chain_order_and_key_names():
+    definition = {
+        "Name": "Full Chain",
+        "GearList": {
+            "PrePedal1": {"Key": "Pedal_Drive", "Type": "Pedals", "KnobValues": {}},
+            "Amp": {"Key": "Amp_DSL", "Type": "Amps", "KnobValues": {}},
+            "PostPedal1": {"Key": "Pedal_Chorus", "Type": "Pedals", "KnobValues": {}},
+            "Rack1": {"Key": "Rack_Delay", "Type": "Racks", "KnobValues": {}},
+            "Cabinet": {"Key": "Cab_412_57_Cone", "Type": "Cabinets", "KnobValues": {}},
+        },
+    }
+
+    blocks = converter._tone_blocks_from_definition(definition)
+
+    assert [(block["role"], block["name"]) for block in blocks] == [
+        ("drive", "Pedal_Drive"),
+        ("amp", "Amp_DSL"),
+        ("modulation", "Pedal_Chorus"),
+        ("delay", "Rack_Delay"),
+        ("cab", "Cab_412_57_Cone"),
+    ]
+
+
 def test_convert_psarc_can_remap_b_standard_to_seven_string(tmp_path, monkeypatch):
     class FakeSong:
         @staticmethod
@@ -563,6 +639,48 @@ def test_inspector_previews_exported_tones(tmp_path, monkeypatch):
         ("Cabinet", "Cab_212", "Cab_212"),
     ]
     assert clean_gear[0].knob_values == {"Gain": 0.2, "Bass": 0.5}
+
+
+def test_inspector_reports_rig_builder_equivalence_confidence(tmp_path, monkeypatch):
+    class FakeSong:
+        @staticmethod
+        def parse(_data):
+            return fake_song()
+
+    data_dir = tmp_path / "rig_builder" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "rs_gear_to_vst.json").write_text(
+        json.dumps({"Amp_Clean": [{"name": "Clean Amp", "bundled": "vst/amps/CleanAmp.vst3"}]}),
+        encoding="utf-8",
+    )
+    (data_dir / "default_captures.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_to_real.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_cab_mic_map.json").write_text(
+        json.dumps({"Cab_212": {"5c": {"effect_name": "Cab_212", "ir_file": "rocksmith/cab_212.wav"}}}),
+        encoding="utf-8",
+    )
+    (data_dir / "rb_cab_overrides.json").write_text(
+        json.dumps({"Cab_212": {"ir_dir": "cabs/Box_212", "prefix": ""}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("FEEDFORGE_RIG_BUILDER_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(inspector, "PSARC", FakePSARC)
+    monkeypatch.setattr(inspector, "Song", FakeSong)
+
+    psarc = tmp_path / "input.psarc"
+    psarc.write_bytes(b"fake")
+
+    preview = inspector.inspect_psarc(psarc)
+    clean_gear = preview.tones[0].definitions[0].gear
+
+    assert clean_gear[0].recommendation_kind == "VST"
+    assert clean_gear[0].recommendation == "Clean Amp"
+    assert clean_gear[0].recommendation_confidence == "curated"
+    assert clean_gear[0].recommendation_source == "rs_gear_to_vst.json"
+    assert clean_gear[1].recommendation == "cabs/Box_212/dyn_cone.wav"
+    assert clean_gear[1].recommendation_confidence == "curated"
+    assert clean_gear[1].recommendation_source == "rb_cab_overrides.json"
 
 
 def test_inspector_previews_rig_builder_routes(tmp_path, monkeypatch):
@@ -697,6 +815,388 @@ def test_seed_rig_builder_routes_writes_playable_rows(tmp_path, monkeypatch):
     assert rows[1][2:6] == ("cabinet", "Cab_212", "ir", "other/greenback 212 1 mono.wav")
 
 
+def test_seed_rig_builder_routes_prefers_real_cab_overrides(tmp_path, monkeypatch):
+    class FakeSong:
+        @staticmethod
+        def parse(_data):
+            return fake_song()
+
+    db_dir = tmp_path / "feedback-desktop" / "slopsmith-config"
+    db_dir.mkdir(parents=True)
+    (db_dir / "nam_irs" / "cabs" / "Box_212").mkdir(parents=True)
+    (db_dir / "nam_irs" / "cabs" / "Box_212" / "dyn_cone.wav").write_bytes(b"ir")
+    db_path = db_dir / "nam_tone.db"
+
+    data_dir = tmp_path / "rig_builder" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "default_captures.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_to_real.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_gear_to_vst.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_knob_to_vst_param.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_cab_mic_map.json").write_text(
+        json.dumps({"Cab_212": {"5c": {"effect_name": "Cab_212", "ir_file": "rocksmith/cab_212.wav"}}}),
+        encoding="utf-8",
+    )
+    (data_dir / "rb_cab_overrides.json").write_text(
+        json.dumps({"Cab_212": {"ir_dir": "cabs/Box_212", "prefix": ""}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(rig_builder_seed, "PSARC", FakePSARC)
+    monkeypatch.setattr(rig_builder_seed, "Song", FakeSong)
+    monkeypatch.setattr(rig_builder_seed, "_rig_builder_data_dir", lambda: data_dir)
+
+    psarc = tmp_path / "input.psarc"
+    psarc.write_bytes(b"fake")
+
+    rig_builder_seed.seed_rig_builder_routes(psarc)
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT rs_gear_type, kind, file FROM preset_pieces WHERE slot = 'cabinet'"
+    ).fetchone()
+    conn.close()
+
+    assert row == ("Cab_212", "ir", "cabs/Box_212/dyn_cone.wav")
+
+
+def test_seed_rig_builder_routes_uses_feedforge_cab_match_overlay(tmp_path, monkeypatch):
+    db_dir = tmp_path / "feedback-desktop" / "slopsmith-config"
+    db_dir.mkdir(parents=True)
+    (db_dir / "nam_irs" / "cabs").mkdir(parents=True)
+    (db_dir / "nam_irs" / "cabs" / "Box_2x12_Alnico_ribbon_offaxis.wav").write_bytes(b"ir")
+
+    data_dir = tmp_path / "rig_builder" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "default_captures.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_to_real.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_gear_to_vst.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_knob_to_vst_param.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_cab_mic_map.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rb_cab_overrides.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(rig_builder_seed, "_rig_builder_data_dir", lambda: data_dir)
+
+    stage = rig_builder_seed._resolve_stage(data_dir, "cabinet", "Cab_CA215C", {})
+
+    assert stage is not None
+    assert stage["gear"] == "Cab_CA215C"
+    assert stage["kind"] == "ir"
+    assert stage["file"] == "cabs/Box_2x12_Alnico_ribbon_offaxis.wav"
+
+
+def test_inspector_recommends_feedforge_cab_match_overlay(tmp_path):
+    data_dir = tmp_path / "rig_builder" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "rs_cab_mic_map.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rb_cab_overrides.json").write_text("{}", encoding="utf-8")
+
+    recommendation = inspector._cab_recommendation(data_dir, "Cab_CA215C")
+
+    assert recommendation["kind"] == "IR"
+    assert recommendation["name"] == "cabs/Box_2x12_Alnico_ribbon_offaxis.wav"
+    assert recommendation["confidence"] == "curated"
+    assert recommendation["source"] == "cab_match_overrides.json"
+
+
+def test_seed_rig_builder_routes_prefers_measured_amp_vst_overlay(tmp_path, monkeypatch):
+    plugin_root = tmp_path / "rig_builder"
+    data_dir = plugin_root / "data"
+    data_dir.mkdir(parents=True)
+    vst_path = plugin_root / "vst" / "amps" / "MarkII.vst3"
+    vst_path.parent.mkdir(parents=True)
+    vst_path.write_bytes(b"vst")
+
+    (data_dir / "default_captures.json").write_text(
+        json.dumps({"Amp_CA38": {"kind": "nam", "model_id": 53162, "tone3000_id": 6298}}),
+        encoding="utf-8",
+    )
+    (data_dir / "rs_to_real.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_gear_to_vst.json").write_text(
+        json.dumps({"Amp_CA38": [{"bundled": "vst/amps/MarkII.vst3"}]}),
+        encoding="utf-8",
+    )
+    (data_dir / "rs_knob_to_vst_param.json").write_text(
+        json.dumps(
+            {
+                "Amp_CA38": {
+                    "markii": {
+                        "Gain": {"param": "Lead Drive", "scale": 0.01},
+                        "_static": {"Cab Sim": 1.0},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(
+        rig_builder_seed,
+        "_amp_overrides",
+        lambda: {"Amp_CA38": {"enabled": True, "prefer": "vst", "bundled": "vst/amps/MarkII.vst3", "cab_sim": "off"}},
+    )
+    stage = rig_builder_seed._resolve_stage(data_dir, "amp", "Amp_CA38", {"Amp_CA38_Gain": 72})
+
+    assert stage is not None
+    assert stage["kind"] == "vst"
+    assert stage["vst_path"] == str(vst_path)
+    assert stage.get("tone3000_id") is None
+    decoded = json.loads(base64.b64decode(stage["vst_state"]["opaque"]).decode("utf-8"))
+    plugin_state = json.loads(decoded["pluginState"])
+    assert plugin_state["params"]["Lead Drive"] == 0.72
+    assert plugin_state["params"]["Cab Sim"] == 0.0
+
+
+def test_seed_rig_builder_routes_skips_disabled_amp_vst_overlay(tmp_path, monkeypatch):
+    plugin_root = tmp_path / "rig_builder"
+    data_dir = plugin_root / "data"
+    data_dir.mkdir(parents=True)
+    vst_path = plugin_root / "vst" / "amps" / "MarkII.vst3"
+    vst_path.parent.mkdir(parents=True)
+    vst_path.write_bytes(b"vst")
+
+    (data_dir / "default_captures.json").write_text(
+        json.dumps({"Amp_CA38": {"kind": "nam", "model_id": 53162, "tone3000_id": 6298}}),
+        encoding="utf-8",
+    )
+    (data_dir / "rs_to_real.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_gear_to_vst.json").write_text(
+        json.dumps({"Amp_CA38": [{"bundled": "vst/amps/MarkII.vst3"}]}),
+        encoding="utf-8",
+    )
+    (data_dir / "rs_knob_to_vst_param.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        rig_builder_seed,
+        "_amp_overrides",
+        lambda: {"Amp_CA38": {"enabled": False, "prefer": "vst", "bundled": "vst/amps/MarkII.vst3"}},
+    )
+    stage = rig_builder_seed._resolve_stage(data_dir, "amp", "Amp_CA38", {"Amp_CA38_Gain": 72})
+
+    assert stage is not None
+    assert stage["kind"] == "vst"
+    assert stage["vst_path"] == str(vst_path)
+    assert stage["assigned_mode"] == "manual_vst"
+    assert sorted(stage["vst_state"]) == ["opaque"]
+
+
+def test_seed_rig_builder_routes_falls_back_to_tone3000_when_amp_vst_missing(tmp_path, monkeypatch):
+    data_dir = tmp_path / "rig_builder" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "default_captures.json").write_text(
+        json.dumps({"Amp_CA38": {"kind": "nam", "model_id": 53162, "tone3000_id": 6298}}),
+        encoding="utf-8",
+    )
+    (data_dir / "rs_to_real.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_gear_to_vst.json").write_text(
+        json.dumps({"Amp_CA38": [{"bundled": "vst/amps/MarkII.vst3"}]}),
+        encoding="utf-8",
+    )
+    (data_dir / "rs_knob_to_vst_param.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        rig_builder_seed,
+        "_amp_overrides",
+        lambda: {"Amp_CA38": {"enabled": False, "prefer": "vst", "bundled": "vst/amps/MarkII.vst3"}},
+    )
+    stage = rig_builder_seed._resolve_stage(data_dir, "amp", "Amp_CA38", {"Amp_CA38_Gain": 72})
+
+    assert stage is not None
+    assert stage["kind"] == "nam"
+    assert stage["tone3000_id"] == 6298
+
+
+def test_seed_rig_builder_routes_can_store_amp_vst_state_as_opaque(tmp_path, monkeypatch):
+    plugin_root = tmp_path / "rig_builder"
+    data_dir = plugin_root / "data"
+    data_dir.mkdir(parents=True)
+    vst_path = plugin_root / "vst" / "amps" / "MarkII.vst3"
+    vst_path.parent.mkdir(parents=True)
+    vst_path.write_bytes(b"vst")
+
+    (data_dir / "default_captures.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_to_real.json").write_text("{}", encoding="utf-8")
+    (data_dir / "rs_gear_to_vst.json").write_text(
+        json.dumps({"Amp_CA38": [{"bundled": "vst/amps/MarkII.vst3"}]}),
+        encoding="utf-8",
+    )
+    (data_dir / "rs_knob_to_vst_param.json").write_text(
+        json.dumps(
+            {
+                "Amp_CA38": {
+                    "markii": {
+                        "Gain": {"param": "Lead Drive", "scale": 0.01},
+                        "_static": {"Cab Sim": 1.0},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        rig_builder_seed,
+        "_amp_overrides",
+        lambda: {
+            "Amp_CA38": {
+                "enabled": True,
+                "prefer": "vst",
+                "bundled": "vst/amps/MarkII.vst3",
+                "cab_sim": "off",
+                "opaque_state": True,
+            }
+        },
+    )
+
+    stage = rig_builder_seed._resolve_stage(data_dir, "amp", "Amp_CA38", {"Amp_CA38_Gain": 72})
+
+    assert stage is not None
+    assert stage["kind"] == "vst"
+    assert stage["assigned_mode"] == "manual_vst"
+    assert sorted(stage["vst_state"]) == ["opaque"]
+    decoded = json.loads(base64.b64decode(stage["vst_state"]["opaque"]).decode("utf-8"))
+    plugin_state = json.loads(decoded["pluginState"])
+    assert plugin_state["params"]["Lead Drive"] == 0.72
+    assert plugin_state["params"]["Cab Sim"] == 0.0
+
+
+def test_inspector_recommends_measured_amp_vst_overlay(tmp_path, monkeypatch):
+    plugin_root = tmp_path / "rig_builder"
+    data_dir = plugin_root / "data"
+    data_dir.mkdir(parents=True)
+    vst_path = plugin_root / "vst" / "amps" / "MarkII.vst3"
+    vst_path.parent.mkdir(parents=True)
+    vst_path.write_bytes(b"vst")
+
+    monkeypatch.setattr(
+        inspector,
+        "_feedforge_amp_overrides",
+        lambda: {"Amp_CA38": {"enabled": True, "prefer": "vst", "bundled": "vst/amps/MarkII.vst3"}},
+    )
+    recommendation = inspector._amp_override_recommendation(data_dir, "Amp_CA38")
+
+    assert recommendation["kind"] == "VST"
+    assert recommendation["name"] == "MarkII"
+    assert recommendation["confidence"] == "measured"
+    assert recommendation["source"] == "amp_match_overrides.json"
+
+
+def test_seed_rig_builder_routes_uses_local_amp_nam_overlay(tmp_path, monkeypatch):
+    config_dir = tmp_path / "feedback-desktop" / "slopsmith-config"
+    model = config_dir / "nam_models" / "amps" / "SVT PUSHED.nam"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"nam")
+    (config_dir / "nam_tone.db").write_bytes(b"")
+
+    data_dir = tmp_path / "rig_builder" / "data"
+    data_dir.mkdir(parents=True)
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(
+        rig_builder_seed,
+        "_amp_overrides",
+        lambda: {
+            "Bass_Amp_HT300B": {
+                "enabled": True,
+                "prefer": "nam",
+                "variants": {
+                    "clean": {"file": "amps/SVT CLEAN.nam", "tone3000_id": 45809, "rs_gain_range": [0, 35]},
+                    "pushed": {"file": "amps/SVT PUSHED.nam", "tone3000_id": 45809, "rs_gain_range": [35, 70]},
+                    "dirty": {"file": "amps/SVT DIRTY.nam", "tone3000_id": 45809, "rs_gain_range": [70, 100]},
+                },
+            }
+        },
+    )
+
+    stage = rig_builder_seed._resolve_stage(data_dir, "amp", "Bass_Amp_HT300B", {"Bass_Amp_HT300B_Gain": 55})
+
+    assert stage is not None
+    assert stage["kind"] == "nam"
+    assert stage["file"] == "amps/SVT PUSHED.nam"
+    assert stage["tone3000_id"] == 45809
+
+
+def test_seed_rig_builder_routes_ignores_missing_local_amp_nam_overlay(tmp_path, monkeypatch):
+    config_dir = tmp_path / "feedback-desktop" / "slopsmith-config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "nam_tone.db").write_bytes(b"")
+
+    data_dir = tmp_path / "rig_builder" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "default_captures.json").write_text(
+        json.dumps({"Bass_Amp_HT300B": {"kind": "nam", "model_id": 72993, "tone3000_id": 2609}}),
+        encoding="utf-8",
+    )
+    (data_dir / "rs_to_real.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(
+        rig_builder_seed,
+        "_amp_overrides",
+        lambda: {
+            "Bass_Amp_HT300B": {
+                "enabled": True,
+                "prefer": "nam",
+                "file": "amps/SVT PUSHED.nam",
+                "tone3000_id": 45809,
+            }
+        },
+    )
+
+    stage = rig_builder_seed._resolve_stage(data_dir, "amp", "Bass_Amp_HT300B", {"Bass_Amp_HT300B_Gain": 55})
+
+    assert stage is not None
+    assert stage["kind"] == "nam"
+    assert stage["file"] is None
+    assert stage["tone3000_id"] == 2609
+
+
+def test_inspector_recommends_local_amp_nam_overlay(monkeypatch):
+    monkeypatch.setattr(
+        inspector,
+        "_feedforge_amp_overrides",
+        lambda: {
+            "Amp_GB50": {
+                "enabled": True,
+                "prefer": "nam",
+                "variants": {
+                    "mid": {
+                        "file": "amps/OB1 JCM 900 Ch. A - 272 boosted clean.nam",
+                        "tone3000_id": 2405,
+                        "rs_gain_range": [35, 70],
+                    }
+                },
+            }
+        },
+    )
+
+    recommendation = inspector._amp_override_recommendation(Path("unused"), "Amp_GB50")
+
+    assert recommendation["kind"] == "NAM"
+    assert recommendation["name"] == "OB1 JCM 900 Ch. A - 272 boosted clean"
+    assert recommendation["detail"] == "amps/OB1 JCM 900 Ch. A - 272 boosted clean.nam"
+    assert recommendation["source"] == "amp_match_overrides.json"
+
+
+def test_seed_rig_builder_repairs_empty_unit_impulse_ir(tmp_path, monkeypatch):
+    config_dir = tmp_path / "feedback-desktop" / "slopsmith-config"
+    ir_path = config_dir / "nam_irs" / "other" / "_rb_unit_impulse.wav"
+    ir_path.parent.mkdir(parents=True)
+    ir_path.write_bytes(b"RIFF\x28\x00\x00\x00WAVEfmt ")
+    (config_dir / "nam_tone.db").write_bytes(b"")
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(rig_builder_seed, "_rig_builder_db", lambda: config_dir / "nam_tone.db")
+
+    rig_builder_seed._ensure_unit_impulse_ir()
+
+    assert ir_path.stat().st_size > 48
+    assert rig_builder_seed._valid_unit_impulse_ir(ir_path)
+
+
 def test_seed_rig_builder_routes_uses_tone3000_capture_ids(tmp_path, monkeypatch):
     class FakeSong:
         @staticmethod
@@ -729,7 +1229,7 @@ def test_seed_rig_builder_routes_uses_tone3000_capture_ids(tmp_path, monkeypatch
 
     result = rig_builder_seed.seed_rig_builder_routes(psarc)
 
-    assert any(tone.tone_key == "Tone_0" and tone.status == "ready" for tone in result.tones)
+    assert any(tone.tone_key == "Tone_0" and tone.status == "partial" for tone in result.tones)
     conn = sqlite3.connect(db_path)
     row = conn.execute(
         "SELECT kind, file, tone3000_id, assigned_mode FROM preset_pieces WHERE rs_gear_type = 'Amp_Clean'"
@@ -794,3 +1294,187 @@ def test_rig_builder_data_dir_accepts_portable_root(tmp_path, monkeypatch):
     monkeypatch.setenv("FEEDFORGE_RIG_BUILDER_DATA_DIR", str(portable_root))
 
     assert inspector._rig_builder_data_dir() == data_dir
+
+
+def test_tone_lab_writes_valid_dry_di_fixtures(tmp_path):
+    fixtures = tone_lab._write_di_fixtures(tmp_path / "fixtures")
+
+    assert {path.name for path in fixtures} == {
+        "di_single_notes.wav",
+        "di_chord_stabs.wav",
+        "di_palm_mute_bursts.wav",
+        "di_sweep_noise.wav",
+    }
+    for path in fixtures:
+        assert path.stat().st_size > 44
+        with wave.open(str(path), "rb") as handle:
+            assert handle.getnchannels() == 1
+            assert handle.getframerate() == 48000
+            assert handle.getsampwidth() == 2
+            assert handle.getnframes() > 48000
+
+
+def test_tone_lab_database_audit_reports_missing_assets(tmp_path):
+    db_dir = tmp_path / "feedback-desktop" / "slopsmith-config"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "nam_tone.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE presets (
+          id INTEGER PRIMARY KEY,
+          name TEXT,
+          model_file TEXT,
+          ir_file TEXT,
+          input_gain REAL,
+          output_gain REAL,
+          gate_threshold REAL,
+          settings_json TEXT
+        );
+        CREATE TABLE tone_mappings (
+          id INTEGER PRIMARY KEY,
+          filename TEXT,
+          tone_key TEXT,
+          preset_id INTEGER
+        );
+        CREATE TABLE preset_pieces (
+          id INTEGER PRIMARY KEY,
+          preset_id INTEGER,
+          slot_order INTEGER,
+          slot TEXT,
+          rs_gear_type TEXT,
+          kind TEXT,
+          file TEXT,
+          params_json TEXT,
+          tone3000_id INTEGER,
+          assigned_mode TEXT,
+          bypassed INTEGER,
+          vst_path TEXT,
+          vst_format TEXT,
+          vst_state TEXT
+        );
+        """
+    )
+    conn.execute("INSERT INTO presets VALUES (1, 'song.feedpak::Tone', '', '', 1, 1, -60, '{}')")
+    conn.execute("INSERT INTO tone_mappings VALUES (1, 'song.feedpak', 'Tone', 1)")
+    conn.execute(
+        "INSERT INTO preset_pieces VALUES (1, 1, 0, 'amp', 'Amp_Missing', 'vst', NULL, '{}', NULL, 'feedforge', 0, ?, 'VST3', NULL)",
+        (str(tmp_path / "missing.vst3"),),
+    )
+    conn.execute(
+        "INSERT INTO preset_pieces VALUES (2, 1, 1, 'cabinet', 'Cab_Missing', 'ir', 'cabs/missing.wav', '{}', NULL, 'feedforge', 0, NULL, NULL, NULL)",
+    )
+    conn.execute(
+        "INSERT INTO preset_pieces VALUES (3, 1, 2, 'rack', 'Rack_Missing', 'none', NULL, '{}', NULL, 'feedforge', 0, NULL, NULL, NULL)",
+    )
+    conn.execute(
+        "INSERT INTO preset_pieces VALUES (4, 1, 3, 'amp', 'Amp_Pending', 'nam', NULL, '{}', 456, 'feedforge', 0, NULL, NULL, NULL)",
+    )
+    conn.commit()
+    conn.close()
+
+    audit = tone_lab._audit_seeded_database(db_path, "song.feedpak")
+
+    assert audit["mappings"] == 1
+    assert audit["preset_pieces"] == 4
+    messages = [issue["message"] for issue in audit["issues"]]
+    assert "VST asset is missing" in messages
+    assert "cab IR asset is missing" in messages
+    assert "unmapped gear stage" in messages
+    assert "NAM stage is pending Tone3000 download" in messages
+
+
+def test_tone_lab_detects_virtual_loopback_devices():
+    inputs, outputs = tone_lab._virtual_loopback_devices(
+        [
+            {
+                "name": "Windows Audio",
+                "inputs": [
+                    "Microphone",
+                    "CABLE Output (VB-Audio Virtual Cable)",
+                    "Microphone (Voicemod Virtual Audio Device (WDM))",
+                ],
+                "outputs": [
+                    "Speakers",
+                    "CABLE Input (VB-Audio Virtual Cable)",
+                    "Line (Voicemod Virtual Audio Device (WDM))",
+                ],
+            }
+        ]
+    )
+
+    assert inputs == [
+        {"type": "Windows Audio", "name": "CABLE Output (VB-Audio Virtual Cable)"},
+        {"type": "Windows Audio", "name": "Microphone (Voicemod Virtual Audio Device (WDM))"},
+    ]
+    assert outputs == [
+        {"type": "Windows Audio", "name": "CABLE Input (VB-Audio Virtual Cable)"},
+        {"type": "Windows Audio", "name": "Line (Voicemod Virtual Audio Device (WDM))"},
+    ]
+
+
+def test_tone_lab_compare_wav_tone_scores_identical_audio_close(tmp_path):
+    sample_rate = 48_000
+    frequencies = [120, 330, 750, 1500, 3200, 6200]
+    samples = [
+        sum(0.04 * math.sin(2 * math.pi * frequency * index / sample_rate) for frequency in frequencies)
+        for index in range(sample_rate)
+    ]
+    reference = tmp_path / "reference.wav"
+    candidate = tmp_path / "candidate.wav"
+    tone_lab._write_wav(reference, samples)
+    tone_lab._write_wav(candidate, [sample * 0.5 for sample in samples])
+
+    result = tone_lab.compare_wav_tone(reference, candidate, output_json=tmp_path / "comparison.json")
+
+    assert result["status"] == "ok"
+    assert result["waveform_correlation"] > 0.999
+    assert result["error_snr_db"] > 70
+    assert result["band_mae_db"] < 0.05
+    assert result["candidate_gain_match_db"] == pytest.approx(6.0206, abs=0.05)
+    assert (tmp_path / "comparison.json").is_file()
+
+
+def test_tone_lab_compare_wav_tone_accepts_float_wav(tmp_path):
+    import numpy as np
+    from scipy.io import wavfile
+
+    sample_rate = 48_000
+    index = np.arange(sample_rate, dtype=np.float32)
+    samples = 0.1 * np.sin(2 * np.pi * 440 * index / sample_rate)
+    reference = tmp_path / "reference_float.wav"
+    candidate = tmp_path / "candidate_float.wav"
+    wavfile.write(reference, sample_rate, samples.astype(np.float32))
+    wavfile.write(candidate, sample_rate, (samples * 0.75).astype(np.float32))
+
+    result = tone_lab.compare_wav_tone(reference, candidate)
+
+    assert result["status"] == "ok"
+    assert result["waveform_correlation"] > 0.999
+    assert result["candidate_gain_match_db"] == pytest.approx(2.498, abs=0.05)
+
+
+def test_tone_lab_compare_wav_tone_detects_spectral_difference(tmp_path):
+    sample_rate = 48_000
+    duration = sample_rate
+    reference_samples = [
+        0.2 * math.sin(2 * math.pi * 160 * index / sample_rate)
+        + 0.05 * math.sin(2 * math.pi * 3200 * index / sample_rate)
+        for index in range(duration)
+    ]
+    candidate_samples = [
+        0.05 * math.sin(2 * math.pi * 160 * index / sample_rate)
+        + 0.2 * math.sin(2 * math.pi * 3200 * index / sample_rate)
+        for index in range(duration)
+    ]
+    reference = tmp_path / "reference.wav"
+    candidate = tmp_path / "candidate.wav"
+    tone_lab._write_wav(reference, reference_samples)
+    tone_lab._write_wav(candidate, candidate_samples)
+
+    result = tone_lab.compare_wav_tone(reference, candidate)
+
+    assert result["status"] == "ok"
+    assert result["band_mae_db"] > 4
+    assert result["band_diffs_candidate_minus_reference_db"]["80-250Hz_db"] < -6
+    assert result["band_diffs_candidate_minus_reference_db"]["2000-4000Hz_db"] > 6

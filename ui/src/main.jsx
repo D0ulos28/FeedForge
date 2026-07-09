@@ -25,8 +25,11 @@ const INSPECTION_WORKERS = 2;
 const QUEUE_RENDER_LIMIT = 500;
 const DEFAULT_CONVERSION_WORKERS = 2;
 const SETTINGS_KEY = "feedforge:desktop-settings";
+const TONE_MAPPING_LOCKED = true;
 const TONE_MIGRATION_WARNING =
-  "Tone migration will also seed or repair local FeedBack Rig Builder routes on this PC after conversion. Existing FeedForge-created routes for these songs may be replaced. Continue?";
+  "Tone mapping is experimental and may not match Rocksmith exactly yet. It can also seed or repair local FeedBack Rig Builder routes on this PC after conversion, replacing existing FeedForge-created routes for these songs. Continue?";
+const TONE_LOCKED_MESSAGE =
+  "Tone mapping is temporarily locked while FeedForge's Rocksmith-to-Rig Builder matching is being refined. FeedForge will convert packages without tone export for now.";
 
 function App() {
   const initialSettingsRef = useRef(null);
@@ -37,9 +40,12 @@ function App() {
   const [items, setItems] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [outputDir, setOutputDir] = useState(() => initialSettingsRef.current.outputDir || null);
+  const [outputLayout, setOutputLayout] = useState(() => initialSettingsRef.current.outputLayout || "flat");
+  const [outputNameFormat, setOutputNameFormat] = useState(() => initialSettingsRef.current.outputNameFormat || "source");
+  const [outputNameTemplate, setOutputNameTemplate] = useState(() => initialSettingsRef.current.outputNameTemplate || "{artist} - {title}");
   const [lastSourcePath, setLastSourcePath] = useState(() => initialSettingsRef.current.lastSourcePath || null);
   const [overwrite, setOverwrite] = useState(false);
-  const [includeTones, setIncludeTones] = useState(() => initialSettingsRef.current.includeTones !== false);
+  const [includeTones, setIncludeTones] = useState(() => TONE_MAPPING_LOCKED ? false : initialSettingsRef.current.includeTones === true);
   const [bStandardTo7String, setBStandardTo7String] = useState(() => initialSettingsRef.current.bStandardTo7String === true);
   const [separateStems, setSeparateStems] = useState(() => initialSettingsRef.current.separateStems === true);
   const [demucsUrl, setDemucsUrl] = useState(() => initialSettingsRef.current.demucsUrl || "");
@@ -82,8 +88,15 @@ function App() {
   }, [items]);
 
   useEffect(() => {
-    writeSettings({ outputDir, lastSourcePath, includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, pythonPath, demucsModel, demucsDevice, demucsStemJobs, rigBuilderDataDir });
-  }, [outputDir, lastSourcePath, includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, pythonPath, demucsModel, demucsDevice, demucsStemJobs, rigBuilderDataDir]);
+    if (TONE_MAPPING_LOCKED) {
+      setIncludeTones(false);
+      if (activeView === "tones") setActiveView("workspace");
+    }
+  }, [activeView]);
+
+  useEffect(() => {
+    writeSettings({ outputDir, outputLayout, outputNameFormat, outputNameTemplate, lastSourcePath, includeTones: TONE_MAPPING_LOCKED ? false : includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, pythonPath, demucsModel, demucsDevice, demucsStemJobs, rigBuilderDataDir });
+  }, [outputDir, outputLayout, outputNameFormat, outputNameTemplate, lastSourcePath, includeTones, bStandardTo7String, separateStems, demucsUrl, demucsInstallDir, pythonPath, demucsModel, demucsDevice, demucsStemJobs, rigBuilderDataDir]);
 
   useEffect(() => {
     let cancelled = false;
@@ -250,7 +263,7 @@ function App() {
   const stemServerMatchesSelectedConfig = stemServerMatchesSelection(stemServerStatus, demucsModel, demucsDevice, demucsStemJobs);
   const stemServerReadyForSelection = stemServerStatus.healthy && stemServerMatchesSelectedConfig;
 
-  async function addFiles(paths) {
+  async function addFiles(paths, sourceRoot = null) {
     const existing = new Set(itemsRef.current.map((item) => normalizePathKey(item.path)));
     const incoming = paths
       .filter((filePath) => filePath.toLowerCase().endsWith(".psarc"))
@@ -264,6 +277,7 @@ function App() {
         id: crypto.randomUUID(),
         path: filePath,
         name: basename(filePath),
+        sourceRoot,
         status: "queued",
         preview: null,
         outputPath: null,
@@ -342,6 +356,12 @@ function App() {
   }
 
   async function chooseFolder() {
+    if (api.pickFolderWithRoot) {
+      const result = await api.pickFolderWithRoot({ defaultPath: lastSourcePath || outputDir || undefined });
+      rememberSourcePath(result.folder || result.files?.[0]);
+      addFiles(result.files || [], result.folder || null);
+      return;
+    }
     const paths = await api.pickFolder({ defaultPath: lastSourcePath || outputDir || undefined });
     rememberSourcePath(paths[0]);
     addFiles(paths);
@@ -458,6 +478,7 @@ function App() {
       pendingPaths.add(key);
       pending.push(item);
     }
+    const batchSourceRoot = commonAncestorDir(pending.map((item) => item.path));
     let index = 0;
 
     async function convertNext() {
@@ -466,7 +487,7 @@ function App() {
       index += 1;
       if (!item) return;
       updateItem(item.id, { status: "converting", error: null });
-      const outputPath = outputDir ? `${outputDir}\\${withoutExtension(item.name)}.feedpak` : null;
+      const outputPath = outputDir ? outputPathForItem(item, outputDir, outputLayout, item.sourceRoot || batchSourceRoot, outputNameFormat, outputNameTemplate) : null;
       const result = await api.convert({
         inputPath: item.path,
         outputPath,
@@ -570,6 +591,17 @@ function App() {
 
         <section className="view-tabs" aria-label="FeedForge sections">
           <button className={activeView === "workspace" ? "active" : ""} onClick={() => setActiveView("workspace")}>Workspace</button>
+          <button
+            className={activeView === "tones" ? "active" : ""}
+            onClick={() => {
+              if (!TONE_MAPPING_LOCKED) setActiveView("tones");
+            }}
+            disabled={TONE_MAPPING_LOCKED}
+            title={TONE_MAPPING_LOCKED ? TONE_LOCKED_MESSAGE : "Inspect Rocksmith tone chains and Rig Builder mappings"}
+          >
+            Tone Mapping
+            {TONE_MAPPING_LOCKED && <span className="tab-lock">Locked</span>}
+          </button>
           <button className={activeView === "settings" ? "active" : ""} onClick={() => setActiveView("settings")}>Settings</button>
         </section>
 
@@ -606,9 +638,64 @@ function App() {
                     {[1, 2, 3, 4, 5, 6].map((value) => <option key={value} value={value}>{value}</option>)}
                   </select>
                 </label>
+                <label className="select-control output-layout-control">
+                  Output layout
+                  <select value={outputLayout} onChange={(event) => setOutputLayout(event.target.value)} disabled={isConverting}>
+                    <option value="flat">Single folder</option>
+                    <option value="preserve">Preserve source folders</option>
+                    <option value="artist">Artist folders</option>
+                  </select>
+                </label>
+                <label className="select-control">
+                  File names
+                  <select value={outputNameFormat} onChange={(event) => setOutputNameFormat(event.target.value)} disabled={isConverting}>
+                    <option value="source">Source filename</option>
+                    <option value="artist-title">Artist - Song</option>
+                    <option value="title-artist">Song - Artist</option>
+                    <option value="artist-album-title">Artist - Album - Song</option>
+                    <option value="custom">Custom template</option>
+                  </select>
+                </label>
+                {outputNameFormat === "custom" && (
+                  <label className="text-control output-name-template">
+                    Naming template
+                    <input
+                      value={outputNameTemplate}
+                      onChange={(event) => setOutputNameTemplate(event.target.value)}
+                      placeholder="{artist} - {title}"
+                      disabled={isConverting}
+                    />
+                    <span>Available: {"{artist}"}, {"{title}"}, {"{album}"}, {"{year}"}, {"{source}"}</span>
+                  </label>
+                )}
                 <div className="option-grid">
                   <label className="toggle"><input type="checkbox" checked={overwrite} onChange={(event) => setOverwrite(event.target.checked)} /> Overwrite existing output</label>
-                  <label className="toggle"><input type="checkbox" checked={includeTones} onChange={(event) => setIncludeTones(event.target.checked)} disabled={isConverting} /> Include tones</label>
+                  <label className="toggle">
+                    <input
+                      type="checkbox"
+                      checked={TONE_MAPPING_LOCKED ? false : includeTones}
+                      onChange={(event) => {
+                        if (TONE_MAPPING_LOCKED) return;
+                        const checked = event.target.checked;
+                        if (checked && !window.confirm(TONE_MIGRATION_WARNING)) return;
+                        setIncludeTones(checked);
+                      }}
+                      disabled={isConverting || TONE_MAPPING_LOCKED}
+                    />
+                    Include tones {TONE_MAPPING_LOCKED && <span className="option-lock">Locked</span>}
+                  </label>
+                  {TONE_MAPPING_LOCKED && (
+                    <div className="inline-warning tone-locked-warning">
+                      <AlertTriangle size={16} />
+                      <span>{TONE_LOCKED_MESSAGE}</span>
+                    </div>
+                  )}
+                  {includeTones && (
+                    <div className="inline-warning">
+                      <AlertTriangle size={16} />
+                      <span>Experimental: tone mapping may not sound identical to Rocksmith and can overwrite FeedForge-created Rig Builder routes.</span>
+                    </div>
+                  )}
                   <label className="toggle"><input type="checkbox" checked={separateStems} onChange={(event) => setSeparateStems(event.target.checked)} disabled={isConverting} /> Separate stems</label>
                   <label className="toggle lab-toggle">
                     <input type="checkbox" checked={bStandardTo7String} onChange={(event) => setBStandardTo7String(event.target.checked)} disabled={isConverting} />
@@ -796,6 +883,15 @@ function App() {
               </div>
             )}
           </section>
+        ) : activeView === "tones" ? (
+          <ToneMappingWorkspace
+            items={filtered}
+            selected={selected}
+            selectedId={selected?.id}
+            onSelect={setSelectedId}
+            onRemove={removeItem}
+            canRemove={!isConverting}
+          />
         ) : (
           <>
             <section className="filter-bar">
@@ -1164,6 +1260,54 @@ function Queue({ items, selectedId, onSelect, onRemove, canRemove }) {
   );
 }
 
+function ToneMappingWorkspace({ items, selected, selectedId, onSelect, onRemove, canRemove }) {
+  const preview = selected?.preview;
+  const tones = preview?.tones || [];
+  const rigBuilder = preview?.rig_builder || [];
+  const arrangements = preview?.arrangements || [];
+  const totalDefinitions = countToneDefinitions(tones);
+  const totalGear = tones.reduce((total, arrangement) => (
+    total + (arrangement.definitions || []).reduce((sum, definition) => sum + (definition.gear || []).length, 0)
+  ), 0);
+  const mappedGear = tones.reduce((total, arrangement) => (
+    total + (arrangement.definitions || []).reduce((sum, definition) => (
+      sum + (definition.gear || []).filter((gear) => gear.recommendation_confidence && gear.recommendation_confidence !== "missing").length
+    ), 0)
+  ), 0);
+  const readyRoutes = tones.reduce((total, arrangement) => (
+    total + (arrangement.definitions || []).filter((definition) => findRigBuilderMapping(rigBuilder, definition)?.status === "ready").length
+  ), 0);
+
+  return (
+    <section className="tone-workspace">
+      <div className="tone-library-column">
+        <Queue items={items} selectedId={selectedId} onSelect={onSelect} onRemove={onRemove} canRemove={canRemove} />
+      </div>
+      <div className="tone-map-column">
+        <section className="tone-map-hero">
+          <div>
+            <span className="eyebrow">Rocksmith to Rig Builder</span>
+            <h2>{preview?.title || selected?.name || "No song selected"}</h2>
+            <p>{preview?.artist || "Import and select a PSARC to inspect its tone chain."}</p>
+          </div>
+          <div className="tone-map-metrics">
+            <Metric label="Tone definitions" value={totalDefinitions} />
+            <Metric label="Gear mapped" value={totalGear ? `${mappedGear}/${totalGear}` : "0"} tone={mappedGear === totalGear && totalGear ? "green" : "blue"} />
+            <Metric label="Ready routes" value={totalDefinitions ? `${readyRoutes}/${totalDefinitions}` : "0"} tone={readyRoutes === totalDefinitions && totalDefinitions ? "green" : "red"} />
+          </div>
+        </section>
+        {selected ? (
+          <ToneInspector arrangements={arrangements} tones={tones} rigBuilder={rigBuilder} mode="mapping" />
+        ) : (
+          <section className="panel tone-panel">
+            <div className="empty">Add PSARC files to inspect Rocksmith tones and Rig Builder equivalents.</div>
+          </section>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function Inspector({ item }) {
   const [tab, setTab] = useState("overview");
   const preview = item?.preview;
@@ -1253,7 +1397,7 @@ function Inspector({ item }) {
   );
 }
 
-function ToneInspector({ arrangements, tones, rigBuilder }) {
+function ToneInspector({ arrangements, tones, rigBuilder, mode = "compact" }) {
   const rows = useMemo(() => (arrangements?.length ? arrangements : tones || []).map((arrangement) => {
     const id = arrangement.id || arrangement.arrangement_id;
     const tone = (tones || []).find((candidate) => candidate.arrangement_id === id);
@@ -1275,7 +1419,7 @@ function ToneInspector({ arrangements, tones, rigBuilder }) {
   }, [rows, activeArrangement]);
 
   return (
-    <section className="panel tone-panel">
+    <section className={`panel tone-panel ${mode === "mapping" ? "mapping-mode" : ""}`}>
       <div className="panel-title">
         <h2>Tone Export</h2>
         <span>{countToneDefinitions(tones)} definitions</span>
@@ -1344,10 +1488,19 @@ function ToneInspector({ arrangements, tones, rigBuilder }) {
                   <div className="gear-list">
                     {(definition.gear || []).length === 0 && <span className="muted-text">No gear chain found.</span>}
                     {(definition.gear || []).map((gear) => (
-                      <div className="gear-chip" key={`${definition.key}-${gear.slot}-${gear.key}`}>
+                      <div className={`gear-chip ${gearClassName(gear)}`} key={`${definition.key}-${gear.slot}-${gear.key}`}>
+                        <div className="gear-visual">
+                          <span className="gear-role">{gearRoleLabel(gear)}</span>
+                          <div className="gear-face">
+                            <b>{gearInitials(gear)}</b>
+                            <i />
+                            <i />
+                            <i />
+                          </div>
+                        </div>
                         <span>{gear.slot}</span>
                         <strong>{gear.key || gear.type || "Unknown gear"}</strong>
-                        <small>{gear.category || gear.type || "mapped by key"} - {gear.knobs} knobs</small>
+                        <small>{gear.category || gear.type || "mapped by key"} / {gear.knobs} knobs</small>
                         <GearRecommendation gear={gear} />
                         <KnobValues values={gear.knob_values} />
                       </div>
@@ -1391,9 +1544,10 @@ function GearRecommendation({ gear }) {
   if (!gear.recommendation && !gear.recommendation_kind) return null;
   return (
     <div className="gear-recommendation">
-      <b>{gear.recommendation_kind || "Mapped"}</b>
+      <b>{gear.recommendation_kind || "Mapped"}{gear.recommendation_confidence ? ` / ${gear.recommendation_confidence}` : ""}</b>
       <span>{gear.recommendation || "No named target"}</span>
       {gear.recommendation_detail && <small>{gear.recommendation_detail}</small>}
+      {gear.recommendation_source && <small>{gear.recommendation_source}</small>}
     </div>
   );
 }
@@ -1404,10 +1558,46 @@ function KnobValues({ values }) {
   return (
     <div className="knob-values">
       {entries.map(([key, value]) => (
-        <span key={key}>{shortKnob(key)} {formatKnob(value)}</span>
+        <span key={key} title={`${shortKnob(key)} ${formatKnob(value)}`}>
+          <b>{shortKnob(key)}</b>
+          <i><em style={{ width: `${knobPercent(value)}%` }} /></i>
+          <small>{formatKnob(value)}</small>
+        </span>
       ))}
     </div>
   );
+}
+
+function gearClassName(gear) {
+  const text = `${gear?.slot || ""} ${gear?.category || ""} ${gear?.key || ""} ${gear?.type || ""}`.toLowerCase();
+  if (text.includes("cab")) return "gear-cab";
+  if (text.includes("amp")) return "gear-amp";
+  if (text.includes("delay") || text.includes("reverb") || text.includes("rack")) return "gear-rack";
+  if (text.includes("dist") || text.includes("drive") || text.includes("fuzz") || text.includes("pedal")) return "gear-pedal";
+  return "gear-effect";
+}
+
+function gearRoleLabel(gear) {
+  const slot = String(gear?.slot || "").toLowerCase();
+  if (slot.includes("cabinet")) return "Cab";
+  if (slot.includes("amp")) return "Amp";
+  if (slot.includes("rack")) return "Rack";
+  if (slot.includes("pre")) return "Pre";
+  if (slot.includes("post")) return "Post";
+  return "FX";
+}
+
+function gearInitials(gear) {
+  const source = String(gear?.key || gear?.type || gear?.slot || "FX").replace(/^(Amp|Cab|Pedal|Rack|Bass_Cab|Cabinet)_/i, "");
+  const tokens = source.split(/[_\s-]+/).filter(Boolean);
+  return (tokens.length > 1 ? `${tokens[0][0]}${tokens[1][0]}` : source.slice(0, 2)).toUpperCase();
+}
+
+function knobPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  if (number >= 0 && number <= 1) return Math.round(number * 100);
+  return Math.max(0, Math.min(100, Math.round(number)));
 }
 
 function shortKnob(value) {
@@ -1524,6 +1714,106 @@ function basename(filePath) {
 
 function withoutExtension(fileName) {
   return fileName.replace(/\.[^.]+$/, "");
+}
+
+function outputPathForItem(item, outputDir, layout, sourceRoot, nameFormat = "source", customTemplate = "{artist} - {title}") {
+  const fileName = outputFileNameForItem(item, nameFormat, customTemplate);
+  if (layout === "artist") {
+    return joinPath(outputDir, safePathSegment(item.preview?.artist || "Unknown Artist"), fileName);
+  }
+  if (layout === "preserve") {
+    const relativeDir = relativeParentDir(item.path, sourceRoot);
+    return relativeDir ? joinPath(outputDir, relativeDir, fileName) : joinPath(outputDir, fileName);
+  }
+  return joinPath(outputDir, fileName);
+}
+
+function outputFileNameForItem(item, format, customTemplate) {
+  const meta = outputNameMetadata(item);
+  const partsByFormat = {
+    source: [meta.source],
+    "artist-title": [meta.artist, meta.title],
+    "title-artist": [meta.title, meta.artist],
+    "artist-album-title": [meta.artist, meta.album, meta.title]
+  };
+  let stem;
+  if (format === "custom") {
+    stem = renderNameTemplate(customTemplate, meta);
+  } else {
+    stem = (partsByFormat[format] || partsByFormat.source)
+      .map((part) => String(part || "").trim())
+      .filter(Boolean)
+      .join(" - ");
+  }
+  return `${safePathSegment(stem, meta.source)}.feedpak`;
+}
+
+function outputNameMetadata(item) {
+  const source = withoutExtension(item?.name || basename(item?.path || "song.psarc"));
+  return {
+    source,
+    artist: item?.preview?.artist || "Unknown Artist",
+    title: item?.preview?.title || source,
+    album: item?.preview?.album || "",
+    year: item?.preview?.year || ""
+  };
+}
+
+function renderNameTemplate(template, metadata) {
+  return String(template || "{source}").replace(/\{(artist|title|album|year|source)\}/gi, (_match, key) => metadata[key.toLowerCase()] || "");
+}
+
+function relativeParentDir(filePath, rootPath) {
+  const parent = parentDir(filePath);
+  if (!parent || !rootPath) return "";
+  const normalizedParent = normalizePath(parent);
+  const normalizedRoot = normalizePath(rootPath);
+  if (normalizedParent === normalizedRoot) return "";
+  const prefix = `${normalizedRoot}\\`;
+  if (!normalizedParent.toLowerCase().startsWith(prefix.toLowerCase())) return "";
+  return normalizedParent.slice(prefix.length);
+}
+
+function commonAncestorDir(paths) {
+  const dirs = (paths || []).map(parentDir).filter(Boolean).map(normalizePath);
+  if (!dirs.length) return null;
+  const split = dirs.map((dir) => dir.split("\\").filter(Boolean));
+  const first = split[0];
+  const parts = [];
+  for (let index = 0; index < first.length; index += 1) {
+    const candidate = first[index].toLowerCase();
+    if (split.every((items) => (items[index] || "").toLowerCase() === candidate)) {
+      parts.push(first[index]);
+    } else {
+      break;
+    }
+  }
+  if (!parts.length) return null;
+  return parts.join("\\");
+}
+
+function joinPath(...parts) {
+  return parts
+    .filter((part) => part !== null && part !== undefined && String(part).length > 0)
+    .map((part, index) => {
+      const value = String(part);
+      if (index === 0) return value.replace(/[\\/]+$/, "");
+      return value.replace(/^[\\/]+|[\\/]+$/g, "");
+    })
+    .join("\\");
+}
+
+function normalizePath(filePath) {
+  return String(filePath || "").replace(/[\\/]+/g, "\\").replace(/[\\/]$/, "");
+}
+
+function safePathSegment(value, fallback = "Unknown Artist") {
+  const cleaned = String(value || "")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/g, "");
+  return cleaned || fallback;
 }
 
 function normalizePathKey(filePath) {

@@ -164,6 +164,19 @@ ipcMain.handle("dialog:pickFolder", async (_event, options = {}) => {
   return files;
 });
 
+ipcMain.handle("dialog:pickFolderWithRoot", async (_event, options = {}) => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Choose a CDLC folder",
+    defaultPath: validDefaultPath(options.defaultPath),
+    properties: ["openDirectory"]
+  });
+  if (result.canceled || !result.filePaths[0]) return { folder: "", files: [] };
+  const folder = result.filePaths[0];
+  const files = await findPsarcFiles(folder);
+  logDebug("dialog.pickFolderWithRoot", { folder, count: files.length });
+  return { folder, files };
+});
+
 ipcMain.handle("files:expandPaths", async (_event, inputPaths) => {
   const found = [];
   for (const inputPath of inputPaths || []) {
@@ -271,7 +284,7 @@ ipcMain.handle("converter:convert", async (_event, payload) => {
     inputPath: payload.inputPath,
     outputPath: payload.outputPath || "",
     overwrite: Boolean(payload.overwrite),
-    includeTones: payload.includeTones !== false,
+    includeTones: payload.includeTones === true,
     bStandardTo7String: Boolean(payload.bStandardTo7String),
     separateStems: Boolean(payload.separateStems),
     hasDemucsUrl: Boolean(payload.demucsUrl),
@@ -280,7 +293,7 @@ ipcMain.handle("converter:convert", async (_event, payload) => {
   const args = [payload.inputPath];
   if (payload.outputPath) args.push("-o", payload.outputPath);
   if (payload.overwrite) args.push("--overwrite");
-  if (payload.includeTones === false) args.push("--no-tones");
+  if (payload.includeTones !== true) args.push("--no-tones");
   if (payload.bStandardTo7String) args.push("--b-standard-to-7-string");
   if (payload.separateStems) args.push("--separate-stems");
   if (payload.demucsUrl) args.push("--demucs-url", payload.demucsUrl);
@@ -298,7 +311,7 @@ ipcMain.handle("converter:convert", async (_event, payload) => {
     stderrTail: tail(result.stderr),
     diagnostics: result.diagnostics
   });
-  const seed = payload.includeTones === false || result.code !== 0 || outputPaths.length > 1
+  const seed = payload.includeTones !== true || result.code !== 0 || outputPaths.length > 1
     ? null
     : await seedRigBuilder(payload.inputPath, payload);
   return {

@@ -47,6 +47,8 @@ class ToneGearPreview:
     recommendation_kind: str = ""
     recommendation: str = ""
     recommendation_detail: str = ""
+    recommendation_confidence: str = ""
+    recommendation_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -274,9 +276,11 @@ def _tone_gear_preview(slot: str, gear: dict[str, Any]) -> ToneGearPreview:
         category=str(gear.get("Category") or ""),
         knobs=len(knobs),
         knob_values={str(key): value for key, value in knobs.items()},
-        recommendation_kind=recommendation["kind"],
-        recommendation=recommendation["name"],
-        recommendation_detail=recommendation["detail"],
+        recommendation_kind=str(recommendation.get("kind") or ""),
+        recommendation=str(recommendation.get("name") or ""),
+        recommendation_detail=str(recommendation.get("detail") or ""),
+        recommendation_confidence=str(recommendation.get("confidence") or ""),
+        recommendation_source=str(recommendation.get("source") or ""),
     )
 
 
@@ -284,11 +288,15 @@ def _gear_recommendation(gear: dict[str, Any]) -> dict[str, str]:
     key = str(gear.get("Key") or gear.get("PedalKey") or gear.get("Type") or "")
     data_dir = _rig_builder_data_dir()
     if not key or data_dir is None:
-        return {"kind": "", "name": "", "detail": ""}
+        return _recommendation("", "", "", "unknown", "")
 
     cab = _cab_recommendation(data_dir, key)
     if cab["name"]:
         return cab
+
+    amp_override = _amp_override_recommendation(data_dir, key)
+    if amp_override["name"]:
+        return amp_override
 
     vst_map = _load_json_file(data_dir / "rs_gear_to_vst.json")
     vst_candidates = vst_map.get(key) if isinstance(vst_map, dict) else None
@@ -300,7 +308,7 @@ def _gear_recommendation(gear: dict[str, Any]) -> dict[str, str]:
             name = primary.get("name") or Path(str(primary.get("bundled") or "")).stem
             asset = Path(str(primary.get("bundled") or "")).name
             detail = asset or str(primary.get("notes") or "")
-            return {"kind": "VST", "name": str(name or ""), "detail": detail}
+            return _recommendation("VST", str(name or ""), detail, "curated", "rs_gear_to_vst.json")
 
     default_captures = _load_json_file(data_dir / "default_captures.json")
     capture = default_captures.get(key) if isinstance(default_captures, dict) else None
@@ -309,6 +317,8 @@ def _gear_recommendation(gear: dict[str, Any]) -> dict[str, str]:
             "kind": str(capture.get("kind") or "NAM").upper(),
             "name": f"tone3000 #{capture['tone3000_id']}",
             "detail": f"model {capture.get('model_id')}" if capture.get("model_id") else "",
+            "confidence": "curated",
+            "source": "default_captures.json",
         }
 
     rs_map = _load_json_file(data_dir / "rs_to_real.json")
@@ -322,26 +332,157 @@ def _gear_recommendation(gear: dict[str, Any]) -> dict[str, str]:
             "kind": str(real.get("category") or "mapped").upper(),
             "name": name or str(real.get("name") or key),
             "detail": str(real.get("tone3000_query") or ""),
+            "confidence": "catalog",
+            "source": "rs_to_real.json",
         }
 
-    return {"kind": "", "name": "", "detail": ""}
+    return _recommendation("", "", "", "missing", "")
+
+
+def _amp_override_recommendation(data_dir: Path, key: str) -> dict[str, str]:
+    override = _case_insensitive_get(_feedforge_amp_overrides(), key)
+    if not isinstance(override, dict) or override.get("enabled") is False:
+        return _recommendation("", "", "", "missing", "")
+    prefer = str(override.get("prefer") or "").lower()
+    if prefer == "nam":
+        spec = _first_amp_file_override(override)
+        file_name = str(spec.get("file") or "").strip("/\\") if isinstance(spec, dict) else ""
+        if not file_name:
+            return _recommendation("", "", "", "missing", "")
+        return _recommendation("NAM", Path(file_name).stem, file_name.replace("\\", "/"), "curated", "amp_match_overrides.json")
+    if prefer != "vst":
+        return _recommendation("", "", "", "missing", "")
+    plugin_root = data_dir.parent
+    bundled = str(override.get("bundled") or "").strip("/\\")
+    candidate = plugin_root / bundled if bundled else None
+    if candidate is not None and not candidate.exists():
+        return _recommendation("", "", "", "missing", "")
+    detail = bundled.replace("\\", "/") if bundled else str(override.get("evidence") or "")
+    return _recommendation("VST", candidate.stem if candidate is not None else key, detail, "measured", "amp_match_overrides.json")
+
+
+def _first_amp_file_override(override: dict[str, Any]) -> dict[str, Any] | None:
+    variants = override.get("variants")
+    if isinstance(variants, dict):
+        for spec in variants.values():
+            if isinstance(spec, dict) and spec.get("file"):
+                return spec
+    return override
+
+
+def _feedforge_amp_overrides() -> dict[str, Any]:
+    loaded = _load_json_file(Path(__file__).resolve().parent / "data" / "amp_match_overrides.json")
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _recommendation(kind: str, name: str, detail: str, confidence: str, source: str) -> dict[str, str]:
+    return {
+        "kind": kind,
+        "name": name,
+        "detail": detail,
+        "confidence": confidence,
+        "source": source,
+    }
 
 
 def _cab_recommendation(data_dir: Path, key: str) -> dict[str, str]:
     mic_map = _load_json_file(data_dir / "rs_cab_mic_map.json")
     if not isinstance(mic_map, dict):
-        return {"kind": "", "name": "", "detail": ""}
+        return _recommendation("", "", "", "missing", "")
+    overrides = _cab_overrides(data_dir)
+    direct_override = _cab_default_override_name(overrides, key)
+    if direct_override:
+        source = "cab_match_overrides.json" if _case_insensitive_get(_feedforge_cab_overrides(), key) else "rb_cab_overrides.json"
+        return _recommendation("IR", direct_override, key, "curated", source)
     for base, variants in mic_map.items():
         if not isinstance(variants, dict):
             continue
         for spec in variants.values():
             if isinstance(spec, dict) and str(spec.get("effect_name") or "").lower() == key.lower():
+                override = _cab_override_name(overrides, str(base), spec)
+                if override:
+                    return _recommendation(
+                        "IR",
+                        override,
+                        f"{base} / {spec.get('label') or spec.get('position') or ''}",
+                        "curated",
+                        "rb_cab_overrides.json",
+                    )
                 return {
                     "kind": "IR",
                     "name": str(spec.get("ir_file") or ""),
                     "detail": f"{base} · {spec.get('label') or spec.get('position') or ''}",
+                    "confidence": "mapped",
+                    "source": "rs_cab_mic_map.json",
                 }
-    return {"kind": "", "name": "", "detail": ""}
+    return _recommendation("", "", "", "missing", "")
+
+
+def _cab_overrides(data_dir: Path) -> dict[str, Any]:
+    installed = _load_json_file(data_dir / "rb_cab_overrides.json")
+    feedforge = _feedforge_cab_overrides()
+    merged: dict[str, Any] = {}
+    if isinstance(installed, dict):
+        merged.update(installed)
+    if isinstance(feedforge, dict):
+        merged.update(feedforge)
+    return merged
+
+
+def _feedforge_cab_overrides() -> dict[str, Any]:
+    loaded = _load_json_file(Path(__file__).resolve().parent / "data" / "cab_match_overrides.json")
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _case_insensitive_get(values: dict[Any, Any], key: str) -> Any:
+    if key in values:
+        return values[key]
+    folded = key.lower()
+    for candidate, value in values.items():
+        if str(candidate).lower() == folded:
+            return value
+    return None
+
+
+def _cab_default_override_name(overrides: Any, key: str) -> str:
+    if not isinstance(overrides, dict):
+        return ""
+    override = _case_insensitive_get(overrides, key)
+    if not isinstance(override, dict):
+        return ""
+    exact = str(override.get("file") or "").strip("/\\")
+    if exact:
+        return exact.replace("\\", "/")
+    ir_dir = str(override.get("ir_dir") or "cabs").strip("/\\")
+    prefix = str(override.get("prefix") or "")
+    for stem in ("dyn_cone", "cond_cone", "ribbon_cone", "tube_cone"):
+        candidate = f"{prefix}_{stem}" if prefix else stem
+        return f"{ir_dir}/{candidate}.wav"
+    return ""
+
+
+def _cab_override_name(overrides: Any, base: str, spec: dict[str, Any]) -> str:
+    if not isinstance(overrides, dict):
+        return ""
+    override = _case_insensitive_get(overrides, base)
+    if not isinstance(override, dict):
+        return ""
+    effect_name = str(spec.get("effect_name") or "")
+    parts = effect_name.split("_")
+    mic = {
+        "57": "dyn",
+        "condenser": "cond",
+        "ribbon": "ribbon",
+        "tube": "tube",
+    }.get(parts[-2].lower() if len(parts) >= 2 else "")
+    position = parts[-1].lower() if parts else ""
+    if mic is None or position not in {"cone", "edge", "offaxis"}:
+        mic = "dyn"
+        position = "cone"
+    ir_dir = str(override.get("ir_dir") or "cabs").strip("/\\")
+    prefix = str(override.get("prefix") or "")
+    stem = f"{prefix}_{mic}_{position}" if prefix else f"{mic}_{position}"
+    return f"{ir_dir}/{stem}.wav"
 
 
 def _amp_variant(real: dict[str, Any], gear: dict[str, Any]) -> dict[str, str] | None:

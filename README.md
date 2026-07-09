@@ -11,8 +11,7 @@ files can be checked before export.
 
 ## Download
 
-Download the installer for normal use. The portable EXE is still available, but
-it starts slower because Windows has to unpack it before launch.
+Download the portable EXE from the latest GitHub release.
 
 ## Community
 
@@ -26,9 +25,11 @@ https://discord.gg/9cUe6cacQN
 1. Open FeedForge.
 2. Add `.psarc` files by browsing, dragging them in, or choosing a folder.
 3. Choose an output folder.
-4. Select the number of conversion workers.
-5. Optional: enable tone export, stem separation, or B-standard remapping.
-6. Click `Convert queue`.
+4. Choose an output layout: one folder, preserve source folders, or artist folders.
+5. Choose output file names: source filename, artist-song, song-artist, or a custom template.
+6. Select the number of conversion workers.
+7. Optional: enable stem separation or B-standard remapping. Tone export is temporarily locked while Rocksmith-to-Rig Builder matching is refined.
+8. Click `Convert queue`.
 
 The app writes `.feedpak` files that can be added to FeedBack.
 

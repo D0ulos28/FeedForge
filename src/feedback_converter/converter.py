@@ -1038,7 +1038,6 @@ def _tone_blocks_from_definition(definition: dict[str, Any] | None) -> list[dict
         "PrePedal3",
         "PrePedal4",
         "Amp",
-        "Cabinet",
         "PostPedal1",
         "PostPedal2",
         "PostPedal3",
@@ -1047,6 +1046,7 @@ def _tone_blocks_from_definition(definition: dict[str, Any] | None) -> list[dict
         "Rack2",
         "Rack3",
         "Rack4",
+        "Cabinet",
     ):
         pedal = gear.get(slot)
         if not isinstance(pedal, dict):
@@ -1058,7 +1058,14 @@ def _tone_blocks_from_definition(definition: dict[str, Any] | None) -> list[dict
 
 
 def _pedal_to_rig_block(slot: str, pedal: dict[str, Any]) -> dict[str, Any] | None:
-    pedal_type = pedal.get("Type") or pedal.get("PedalKey") or pedal.get("Key") or pedal.get("Category")
+    pedal_type = (
+        pedal.get("Key")
+        or pedal.get("PedalKey")
+        or pedal.get("GearKey")
+        or pedal.get("EffectKey")
+        or pedal.get("Type")
+        or pedal.get("Category")
+    )
     knobs = pedal.get("KnobValues")
     if pedal_type in (None, "") and not isinstance(knobs, dict):
         return None
@@ -1084,7 +1091,14 @@ def _gear_slot_role(slot: str, pedal: dict[str, Any]) -> str:
     if slot == "Cabinet":
         return "cab"
     category = str(pedal.get("Category") or "").lower()
-    pedal_type = str(pedal.get("Type") or pedal.get("PedalKey") or pedal.get("Key") or "").lower()
+    pedal_type = str(
+        pedal.get("Key")
+        or pedal.get("PedalKey")
+        or pedal.get("GearKey")
+        or pedal.get("EffectKey")
+        or pedal.get("Type")
+        or ""
+    ).lower()
     text = f"{category} {pedal_type}"
     if "delay" in text or "echo" in text:
         return "delay"

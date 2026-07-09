@@ -39,6 +39,7 @@ window.addEventListener("unhandledrejection", (event) => {
 contextBridge.exposeInMainWorld("feedbackConverter", {
   pickPsarc: (options) => ipcRenderer.invoke("dialog:pickPsarc", options),
   pickFolder: (options) => ipcRenderer.invoke("dialog:pickFolder", options),
+  pickFolderWithRoot: (options) => ipcRenderer.invoke("dialog:pickFolderWithRoot", options),
   pickOutput: (options) => ipcRenderer.invoke("dialog:pickOutput", options),
   pickRigBuilderData: (options) => ipcRenderer.invoke("dialog:pickRigBuilderData", options),
   pickDemucsInstallDir: (options) => ipcRenderer.invoke("dialog:pickDemucsInstallDir", options),

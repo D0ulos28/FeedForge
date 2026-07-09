@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
+import urllib.error
+import urllib.request
+import wave
+import base64
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -146,6 +151,8 @@ def seed_rig_builder_routes(input_psarc: Path, *, force: bool = True) -> SeedRes
                 seeded.append(_seed_definition(conn, data_dir, song_key, tone_key, definition))
         if any(tone.missing for tone in seeded):
             _enable_feedback_tone3000_fallback()
+            if _download_pending_song_assignments(conn, song_key):
+                seeded = _refresh_seeded_tone_statuses(conn, song_key, seeded)
         conn.commit()
         return SeedResult(db_path=db_path, song_key=song_key, tones=seeded)
     finally:
@@ -160,7 +167,12 @@ def _seed_definition(
     definition: dict[str, Any],
 ) -> SeededTone:
     missing: list[str] = []
+    pending: list[str] = []
     stages = _stages_from_definition(data_dir, definition, missing)
+    if any(stage.get("slot") == "amp" and stage.get("kind") == "vst" for stage in stages):
+        _ensure_unit_impulse_ir()
+    for stage in stages:
+        _reuse_existing_capture_assignment(conn, stage)
     _delete_mapping(conn, song_key, tone_key)
     if not stages:
         return SeededTone(
@@ -186,7 +198,7 @@ def _seed_definition(
             "INSERT INTO preset_pieces "
             "(preset_id, slot_order, slot, rs_gear_type, kind, file, params_json, tone3000_id, "
             "assigned_mode, bypassed, vst_path, vst_format, vst_state) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'feedforge', 0, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
             (
                 preset_id,
                 slot_order,
@@ -196,12 +208,15 @@ def _seed_definition(
                 stage.get("file"),
                 json.dumps(stage.get("params") or {}, ensure_ascii=False),
                 stage.get("tone3000_id"),
+                stage.get("assigned_mode") or "feedforge",
                 stage.get("vst_path"),
                 stage.get("vst_format"),
                 json.dumps(stage.get("vst_state"), ensure_ascii=False) if stage.get("vst_state") else None,
             ),
         )
         stage_count += 1
+        if stage["kind"] == "nam" and stage.get("tone3000_id") and not stage.get("file"):
+            pending.append(stage["gear"])
         if not model_file and stage["kind"] == "nam" and stage.get("file"):
             model_file = stage["file"]
         if not ir_file and stage["kind"] in {"ir", "rs_ir"} and stage.get("file"):
@@ -215,11 +230,12 @@ def _seed_definition(
         "INSERT INTO tone_mappings (filename, tone_key, preset_id) VALUES (?, ?, ?)",
         (song_key, tone_key, preset_id),
     )
+    unresolved = missing + [f"{gear} (Tone3000 download pending)" for gear in pending]
     return SeededTone(
         tone_key=tone_key,
-        status="partial" if missing else "ready",
+        status="partial" if unresolved else "ready",
         stages=stage_count,
-        missing=missing,
+        missing=unresolved,
     )
 
 
@@ -258,23 +274,22 @@ def _stages_from_definition(
 
 def _resolve_stage(data_dir: Path, slot: str, gear_key: str, params: dict[str, Any]) -> dict[str, Any] | None:
     if slot == "amp":
+        override_vst = _amp_override_vst(data_dir, gear_key)
+        if override_vst:
+            return _vst_stage(slot, gear_key, params, override_vst, data_dir)
+        override_nam = _amp_override_nam(data_dir, gear_key, params)
+        if override_nam:
+            return override_nam
+        vst = _resolve_vst(data_dir, gear_key)
+        if vst:
+            return _vst_stage(slot, gear_key, params, vst, data_dir)
         capture = _resolve_tone3000_capture(data_dir, slot, gear_key, params)
         if capture:
             return capture
 
     vst = _resolve_vst(data_dir, gear_key)
     if vst:
-        vst_state = _build_vst_state(data_dir, gear_key, vst, params)
-        return {
-            "slot": slot,
-            "gear": gear_key,
-            "kind": "vst",
-            "file": None,
-            "params": params,
-            "vst_path": str(vst),
-            "vst_format": "VST3",
-            "vst_state": vst_state,
-        }
+        return _vst_stage(slot, gear_key, params, vst, data_dir)
     if slot == "cabinet":
         cab = _resolve_cab_ir(data_dir, gear_key)
         if cab:
@@ -292,6 +307,114 @@ def _resolve_stage(data_dir: Path, slot: str, gear_key: str, params: dict[str, A
     if capture:
         return capture
     return None
+
+
+def _vst_stage(slot: str, gear_key: str, params: dict[str, Any], vst: Path, data_dir: Path) -> dict[str, Any]:
+    vst_state = _build_vst_state(data_dir, gear_key, vst, params)
+    amp_override = _case_insensitive_get(_amp_overrides(), gear_key) if slot == "amp" else None
+    if isinstance(amp_override, dict) and str(amp_override.get("cab_sim") or "").lower() in {"off", "false", "0"}:
+        vst_state = dict(vst_state or {"params": {}})
+        vst_params = dict(vst_state.get("params") or {})
+        vst_params["Cab Sim"] = 0.0
+        vst_state["params"] = vst_params
+    if slot == "amp" and (amp_override is None or isinstance(amp_override, dict)):
+        vst_state = _opaque_vst_state(vst, "VST3", vst_state)
+    assigned_mode = "manual_vst" if slot == "amp" else "feedforge"
+    return {
+        "slot": slot,
+        "gear": gear_key,
+        "kind": "vst",
+        "file": None,
+        "params": params,
+        "assigned_mode": assigned_mode,
+        "vst_path": str(vst),
+        "vst_format": "VST3",
+        "vst_state": vst_state,
+    }
+
+
+def _opaque_vst_state(vst_path: Path, vst_format: str, vst_state: dict[str, Any] | None) -> dict[str, Any]:
+    wrapper = {
+        "pluginPath": str(vst_path),
+        "format": vst_format,
+        "pluginState": json.dumps(vst_state or {"params": {}}, ensure_ascii=False),
+    }
+    payload = json.dumps(wrapper, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return {"opaque": base64.b64encode(payload).decode("ascii")}
+
+
+def _amp_override_vst(data_dir: Path, gear_key: str) -> Path | None:
+    override = _case_insensitive_get(_amp_overrides(), gear_key)
+    if (
+        not isinstance(override, dict)
+        or override.get("enabled") is False
+        or str(override.get("prefer") or "").lower() != "vst"
+    ):
+        return None
+    plugin_root = data_dir.parent
+    bundled = str(override.get("bundled") or "").strip("/\\")
+    if bundled:
+        candidate = plugin_root / bundled
+        if candidate.exists():
+            return candidate
+    return _resolve_vst(data_dir, gear_key)
+
+
+def _amp_override_nam(data_dir: Path, gear_key: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    override = _case_insensitive_get(_amp_overrides(), gear_key)
+    if (
+        not isinstance(override, dict)
+        or override.get("enabled") is False
+        or str(override.get("prefer") or "").lower() != "nam"
+    ):
+        return None
+    spec = _select_amp_file_override(override, gear_key, params)
+    if not isinstance(spec, dict):
+        return None
+    file_name = str(spec.get("file") or "").strip("/\\")
+    if not file_name:
+        return None
+    config_dir = _rig_builder_config_dir()
+    if config_dir is None:
+        return None
+    relative = file_name.replace("\\", "/")
+    if not (config_dir / "nam_models" / relative).exists():
+        return None
+    return {
+        "slot": "amp",
+        "gear": gear_key,
+        "kind": "nam",
+        "file": relative,
+        "params": params,
+        "tone3000_id": _int_or_none(spec.get("tone3000_id") or override.get("tone3000_id")),
+        "vst_path": None,
+        "vst_format": None,
+        "vst_state": None,
+    }
+
+
+def _select_amp_file_override(override: dict[str, Any], gear_key: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    variants = override.get("variants")
+    if isinstance(variants, dict):
+        gain = _gain_value(gear_key, params)
+        if gain is None:
+            gain = 50.0
+        for spec in variants.values():
+            if not isinstance(spec, dict):
+                continue
+            lo_hi = spec.get("rs_gain_range") or []
+            if len(lo_hi) != 2:
+                continue
+            lo = _float_or_none(lo_hi[0])
+            hi = _float_or_none(lo_hi[1])
+            if lo is not None and hi is not None and lo <= gain <= hi:
+                return spec
+    return override
+
+
+def _amp_overrides() -> dict[str, Any]:
+    loaded = _load_json_file(Path(__file__).resolve().parent / "data" / "amp_match_overrides.json")
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _resolve_tone3000_capture(data_dir: Path, slot: str, gear_key: str, params: dict[str, Any]) -> dict[str, Any] | None:
@@ -314,6 +437,120 @@ def _resolve_tone3000_capture(data_dir: Path, slot: str, gear_key: str, params: 
     }
 
 
+def _reuse_existing_capture_assignment(conn: sqlite3.Connection, stage: dict[str, Any]) -> None:
+    if stage.get("kind") not in {"nam", "ir"} or stage.get("file"):
+        return
+    gear = str(stage.get("gear") or "")
+    if not gear:
+        return
+    tone3000_id = _int_or_none(stage.get("tone3000_id"))
+    if tone3000_id is not None:
+        row = conn.execute(
+            "SELECT kind, file FROM preset_pieces "
+            "WHERE rs_gear_type = ? AND tone3000_id = ? "
+            "AND kind IN ('nam', 'ir') AND file IS NOT NULL AND file != '' "
+            "ORDER BY (assigned_mode IN ('manual', 'manual_vst')) DESC, id DESC LIMIT 1",
+            (gear, tone3000_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT kind, file FROM preset_pieces "
+            "WHERE rs_gear_type = ? AND kind IN ('nam', 'ir') "
+            "AND file IS NOT NULL AND file != '' "
+            "ORDER BY (assigned_mode IN ('manual', 'manual_vst')) DESC, id DESC LIMIT 1",
+            (gear,),
+        ).fetchone()
+    if row:
+        stage["kind"] = row[0]
+        stage["file"] = row[1]
+
+
+def _download_pending_song_assignments(conn: sqlite3.Connection, song_key: str) -> bool:
+    if str(os.environ.get("FEEDFORGE_RIG_BUILDER_AUTO_DOWNLOAD", "1")).lower() in {"0", "false", "no"}:
+        return False
+    backend = _find_feedback_backend()
+    if backend is None:
+        return False
+    rows = conn.execute(
+        "SELECT DISTINCT pp.rs_gear_type, pp.tone3000_id "
+        "FROM tone_mappings tm JOIN preset_pieces pp ON pp.preset_id = tm.preset_id "
+        "WHERE tm.filename = ? AND pp.kind = 'nam' "
+        "AND (pp.file IS NULL OR pp.file = '') AND pp.tone3000_id IS NOT NULL",
+        (song_key,),
+    ).fetchall()
+    downloaded = False
+    for gear, tone3000_id in rows:
+        if not gear or not tone3000_id:
+            continue
+        payload = json.dumps({"rs_gear": gear, "tone3000_id": int(tone3000_id)}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{backend}/api/plugins/rig_builder/download_for_gear",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:  # noqa: S310 - localhost Rig Builder API
+                result = json.loads(response.read().decode("utf-8-sig"))
+            downloaded = downloaded or bool(result.get("ok") and result.get("file"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError):
+            continue
+    return downloaded
+
+
+def _find_feedback_backend() -> str | None:
+    for port in range(18000, 18011):
+        url = f"http://127.0.0.1:{port}"
+        try:
+            with urllib.request.urlopen(f"{url}/api/plugins/rig_builder/settings", timeout=0.3) as response:  # noqa: S310
+                if response.status < 500:
+                    return url
+        except (OSError, urllib.error.URLError):
+            continue
+    return None
+
+
+def _refresh_seeded_tone_statuses(
+    conn: sqlite3.Connection,
+    song_key: str,
+    seeded: list[SeededTone],
+) -> list[SeededTone]:
+    refreshed: list[SeededTone] = []
+    for tone in seeded:
+        row = conn.execute(
+            "SELECT preset_id FROM tone_mappings WHERE filename = ? AND tone_key = ? LIMIT 1",
+            (song_key, tone.tone_key),
+        ).fetchone()
+        if row is None:
+            refreshed.append(tone)
+            continue
+        pieces = conn.execute(
+            "SELECT rs_gear_type, kind, file, tone3000_id FROM preset_pieces "
+            "WHERE preset_id = ? ORDER BY slot_order",
+            (row[0],),
+        ).fetchall()
+        missing: list[str] = []
+        for gear, kind, file, tone3000_id in pieces:
+            gear_name = str(gear or "")
+            stage_kind = str(kind or "none")
+            if stage_kind == "none":
+                missing.append(gear_name)
+            elif stage_kind == "nam" and not file:
+                if tone3000_id:
+                    missing.append(f"{gear_name} (Tone3000 download pending)")
+                else:
+                    missing.append(gear_name)
+        refreshed.append(
+            SeededTone(
+                tone_key=tone.tone_key,
+                status="partial" if missing else ("ready" if tone.stages else tone.status),
+                stages=tone.stages,
+                missing=missing,
+            )
+        )
+    return refreshed
+
+
 def _tone3000_spec_from_real_map(data_dir: Path, gear_key: str, params: dict[str, Any]) -> dict[str, Any] | None:
     real_map = _load_json_file(data_dir / "rs_to_real.json")
     real = real_map.get(gear_key) if isinstance(real_map, dict) else None
@@ -321,7 +558,7 @@ def _tone3000_spec_from_real_map(data_dir: Path, gear_key: str, params: dict[str
         return None
     variants = real.get("gain_variants")
     if isinstance(variants, dict):
-        gain = _float_or_none(params.get("Gain"))
+        gain = _gain_value(gear_key, params)
         if gain is None:
             gain = 50.0
         for spec in variants.values():
@@ -343,6 +580,19 @@ def _tone3000_spec_from_defaults(data_dir: Path, gear_key: str) -> dict[str, Any
     defaults = _load_json_file(data_dir / "default_captures.json")
     spec = defaults.get(gear_key) if isinstance(defaults, dict) else None
     return spec if isinstance(spec, dict) else None
+
+
+def _gain_value(gear_key: str, params: dict[str, Any]) -> float | None:
+    for key in ("Gain", f"{gear_key}_Gain"):
+        gain = _float_or_none(params.get(key))
+        if gain is not None:
+            return gain
+    for key, value in params.items():
+        if str(key).lower().endswith("_gain"):
+            gain = _float_or_none(value)
+            if gain is not None:
+                return gain
+    return None
 
 
 def _resolve_vst(data_dir: Path, gear_key: str) -> Path | None:
@@ -525,21 +775,104 @@ def _resolve_cab_ir(data_dir: Path, gear_key: str) -> dict[str, str] | None:
         return None
     ir_root = config_dir / "nam_irs"
     mic_map = _load_json_file(data_dir / "rs_cab_mic_map.json")
+    overrides = _cab_overrides(data_dir)
     if isinstance(mic_map, dict):
         for base, variants in mic_map.items():
             if not isinstance(variants, dict):
                 continue
             for spec in variants.values():
                 if isinstance(spec, dict) and str(spec.get("effect_name") or "").lower() == gear_key.lower():
+                    override = _cab_override_ir(overrides, ir_root, str(base), spec)
+                    if not override:
+                        override = _default_cab_override_ir(overrides, ir_root, str(base))
+                    if override:
+                        return {"gear": str(base), "kind": "ir", "file": override}
                     file_name = str(spec.get("ir_file") or "")
                     if file_name and (ir_root / file_name).exists():
                         return {"gear": str(base), "kind": "rs_ir", "file": file_name}
                     fallback = _fallback_ir(ir_root, str(base))
                     if fallback:
                         return {"gear": str(base), "kind": "ir", "file": fallback}
+    override = _default_cab_override_ir(overrides, ir_root, gear_key)
+    if override:
+        return {"gear": gear_key, "kind": "ir", "file": override}
     fallback = _fallback_ir(ir_root, gear_key)
     if fallback:
         return {"gear": gear_key, "kind": "ir", "file": fallback}
+    return None
+
+
+def _cab_override_ir(overrides: Any, ir_root: Path, base: str, spec: dict[str, Any]) -> str | None:
+    if not isinstance(overrides, dict):
+        return None
+    override = _case_insensitive_get(overrides, base)
+    if not isinstance(override, dict):
+        return None
+    exact = _exact_cab_override_ir(override, ir_root)
+    if exact:
+        return exact
+    effect_name = str(spec.get("effect_name") or "")
+    parts = effect_name.split("_")
+    if len(parts) < 2:
+        return None
+    mic = {
+        "57": "dyn",
+        "condenser": "cond",
+        "ribbon": "ribbon",
+        "tube": "tube",
+    }.get(parts[-2].lower())
+    position = parts[-1].lower()
+    if mic is None or position not in {"cone", "edge", "offaxis"}:
+        return None
+    ir_dir = str(override.get("ir_dir") or "cabs").strip("/\\")
+    prefix = str(override.get("prefix") or "")
+    stem = f"{prefix}_{mic}_{position}" if prefix else f"{mic}_{position}"
+    candidate = f"{ir_dir}/{stem}.wav"
+    return candidate if (ir_root / candidate).exists() else None
+
+
+def _cab_overrides(data_dir: Path) -> dict[str, Any]:
+    installed = _load_json_file(data_dir / "rb_cab_overrides.json")
+    feedforge = _load_json_file(Path(__file__).resolve().parent / "data" / "cab_match_overrides.json")
+    merged: dict[str, Any] = {}
+    if isinstance(installed, dict):
+        merged.update(installed)
+    if isinstance(feedforge, dict):
+        merged.update(feedforge)
+    return merged
+
+
+def _default_cab_override_ir(overrides: Any, ir_root: Path, gear_key: str) -> str | None:
+    if not isinstance(overrides, dict):
+        return None
+    override = _case_insensitive_get(overrides, gear_key)
+    if not isinstance(override, dict):
+        return None
+    exact = _exact_cab_override_ir(override, ir_root)
+    if exact:
+        return exact
+    ir_dir = str(override.get("ir_dir") or "cabs").strip("/\\")
+    for stem in ("dyn_cone", "cond_cone", "ribbon_cone", "tube_cone"):
+        candidate = f"{ir_dir}/{stem}.wav"
+        if (ir_root / candidate).exists():
+            return candidate
+    return None
+
+
+def _exact_cab_override_ir(override: dict[str, Any], ir_root: Path) -> str | None:
+    exact = str(override.get("file") or "").strip("/\\")
+    if exact and (ir_root / exact).exists():
+        return exact.replace("\\", "/")
+    return None
+
+
+def _case_insensitive_get(values: dict[Any, Any], key: str) -> Any:
+    if key in values:
+        return values[key]
+    folded = key.lower()
+    for candidate, value in values.items():
+        if str(candidate).lower() == folded:
+            return value
     return None
 
 
@@ -623,6 +956,35 @@ def _rig_builder_config_dir() -> Path | None:
         return db.parent
     candidate = _default_rig_builder_db_path()
     return candidate.parent if candidate else None
+
+
+def _ensure_unit_impulse_ir() -> None:
+    config_dir = _rig_builder_config_dir()
+    if config_dir is None:
+        return
+    path = config_dir / "nam_irs" / "other" / "_rb_unit_impulse.wav"
+    if _valid_unit_impulse_ir(path):
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(48_000)
+            handle.writeframes((32767).to_bytes(2, byteorder="little", signed=True) + (b"\x00\x00" * 255))
+    except OSError:
+        return
+
+
+def _valid_unit_impulse_ir(path: Path) -> bool:
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if handle.getnchannels() < 1 or handle.getsampwidth() != 2 or handle.getnframes() < 1:
+                return False
+            frames = handle.readframes(min(handle.getnframes(), 256))
+    except (OSError, EOFError, wave.Error):
+        return False
+    return any(byte != 0 for byte in frames)
 
 
 def _enable_feedback_tone3000_fallback() -> None:

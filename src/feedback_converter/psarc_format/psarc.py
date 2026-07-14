@@ -15,7 +15,8 @@ from construct import (
     this,
 )
 
-from .crypto import decrypt_bom, encrypt_bom, decrypt_psarc, encrypt_psarc
+from collections.abc import Mapping
+from .crypto import decrypt_bom, encrypt_bom, decrypt_psarc, encrypt_psarc, decrypt_sng, MAC_KEY, WIN_KEY
 
 ENTRY = Struct(
     "md5" / Bytes(16),
@@ -123,6 +124,47 @@ def create_bom(entries):
     return {"entries": entries, "zlength": zlength, "header_size": header_size}
 
 
+class LazyPSARCContent(Mapping):
+    def __init__(self, stream, header, end_offsets, crypto):
+        self.stream = stream
+        self.header = header
+        self.end_offsets = end_offsets
+        self.crypto = crypto
+        self._cache = {}
+
+        # Parse listing entry (BOM index 0)
+        listing_data = read_entry(self.stream, 0, self.header.bom, self.end_offsets[0])
+        self.listing = listing_data.decode().splitlines()
+        self._mapping = {name: i + 1 for i, name in enumerate(self.listing)}
+
+    def __len__(self):
+        return len(self._mapping)
+
+    def __iter__(self):
+        return iter(self._mapping)
+
+    def __getitem__(self, key):
+        if key not in self._mapping:
+            raise KeyError(key)
+        if key in self._cache:
+            return self._cache[key]
+
+        index = self._mapping[key]
+        data = read_entry(self.stream, index, self.header.bom, self.end_offsets[index])
+        if self.crypto:
+            normalized = key.replace("\\", "/").lower()
+            if "songs/bin/macos/" in normalized:
+                data = decrypt_sng(data, MAC_KEY)
+            elif "songs/bin/generic/" in normalized:
+                data = decrypt_sng(data, WIN_KEY)
+
+        self._cache[key] = data
+        return data
+
+    def copy(self):
+        return dict(self.items())
+
+
 class PSARC(Construct):
     def __init__(self, crypto=True):
         self.crypto = crypto
@@ -134,14 +176,7 @@ class PSARC(Construct):
         file_size = stream.tell()
         offsets = [entry.offset for entry in header.bom.entries]
         end_offsets = offsets[1:] + [file_size]
-        listing, *entries = [
-            read_entry(stream, i, header.bom, end_offsets[i]) for i in range(header.n_entries)
-        ]
-        listing = listing.decode().splitlines()
-        content = dict(zip(listing, entries))
-        if self.crypto:
-            content = decrypt_psarc(content)
-        return content
+        return LazyPSARCContent(stream, header, end_offsets, self.crypto)
 
     def _build(self, content, stream, context, path):
         if self.crypto:

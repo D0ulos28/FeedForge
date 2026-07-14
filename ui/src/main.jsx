@@ -1717,4 +1717,43 @@ function parentDir(filePath) {
   return index > 0 ? normalized.slice(0, index) : normalized;
 }
 
-createRoot(document.getElementById("root")).render(<App />);
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error("Unhandled UI Error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: "30px", color: "#f87171", backgroundColor: "#111827", height: "100vh", fontFamily: "sans-serif" }}>
+          <h2 style={{ fontSize: "1.5rem", marginBottom: "15px" }}>An unexpected UI error occurred.</h2>
+          <pre style={{ backgroundColor: "#1f2937", color: "#e5e7eb", padding: "15px", borderRadius: "6px", overflowX: "auto", fontSize: "0.9rem", lineHeight: "1.4" }}>
+            {this.state.error?.stack || this.state.error?.toString()}
+          </pre>
+          <button
+            onClick={() => window.location.reload()}
+            style={{ marginTop: "20px", padding: "10px 20px", backgroundColor: "#3b82f6", color: "#ffffff", border: "none", borderRadius: "6px", cursor: "pointer", fontWeight: "bold" }}
+          >
+            Reload Application
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+createRoot(document.getElementById("root")).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);

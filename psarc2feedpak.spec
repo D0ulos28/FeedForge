@@ -7,8 +7,6 @@ a = Analysis(
     binaries=[
         ('src\\feedback_converter\\tools\\ww2ogg.exe', 'feedback_converter\\tools'),
         ('src\\feedback_converter\\tools\\vgmstream-cli.exe', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\oggenc.exe', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\topng.exe', 'feedback_converter\\tools'),
         ('src\\feedback_converter\\tools\\avcodec-vgmstream-59.dll', 'feedback_converter\\tools'),
         ('src\\feedback_converter\\tools\\avformat-vgmstream-59.dll', 'feedback_converter\\tools'),
         ('src\\feedback_converter\\tools\\avutil-vgmstream-57.dll', 'feedback_converter\\tools'),

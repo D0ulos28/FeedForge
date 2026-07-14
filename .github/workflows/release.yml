@@ -36,6 +36,22 @@ jobs:
       - name: Install Node.js dependencies
         run: npm ci
 
+      - name: Download missing CLI tools
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path src\feedback_converter\tools
+          
+          # Download and extract ww2ogg
+          Invoke-WebRequest -Uri "https://hcs64.com/files/ww2ogg04.zip" -OutFile "ww2ogg.zip"
+          Expand-Archive -Path "ww2ogg.zip" -DestinationPath "ww2ogg_extracted" -Force
+          Copy-Item -Path "ww2ogg_extracted\ww2ogg.exe" -Destination "src\feedback_converter\tools\ww2ogg.exe" -Force
+          
+          # Download and extract vgmstream
+          Invoke-WebRequest -Uri "https://github.com/vgmstream/vgmstream/releases/latest/download/vgmstream-win.zip" -OutFile "vgmstream.zip"
+          Expand-Archive -Path "vgmstream.zip" -DestinationPath "vgmstream_extracted" -Force
+          Copy-Item -Path "vgmstream_extracted\vgmstream-cli.exe" -Destination "src\feedback_converter\tools\vgmstream-cli.exe" -Force
+          Copy-Item -Path "vgmstream_extracted\*.dll" -Destination "src\feedback_converter\tools\" -Force
+
       - name: Build and Package App
         run: npm run release
 

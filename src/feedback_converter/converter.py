@@ -2110,28 +2110,59 @@ def _post_multipart_json(
 ) -> dict[str, Any]:
     boundary = uuid.uuid4().hex
     mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-    chunks: list[bytes] = []
+    prefix_chunks: list[bytes] = []
     for name, value in fields.items():
-        chunks.append(
+        prefix_chunks.append(
             (
                 f"--{boundary}\r\n"
                 f"Content-Disposition: form-data; name=\"{name}\"\r\n\r\n"
                 f"{value}\r\n"
             ).encode("utf-8")
         )
-    chunks.append(
+    prefix_chunks.append(
         (
             f"--{boundary}\r\n"
             f"Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{file_path.name}\"\r\n"
             f"Content-Type: {mime}\r\n\r\n"
         ).encode("utf-8")
     )
-    chunks.append(file_path.read_bytes())
-    chunks.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    prefix = b"".join(prefix_chunks)
+    suffix = f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    class MultipartFileStream:
+        def __init__(self, prefix_bytes: bytes, path: Path, suffix_bytes: bytes):
+            self.prefix = prefix_bytes
+            self.file = path.open("rb")
+            self.suffix = suffix_bytes
+            self.state = 0  # 0: prefix, 1: file, 2: suffix, 3: EOF
+
+        def read(self, size: int = -1) -> bytes:
+            if self.state == 0:
+                self.state = 1
+                return self.prefix
+            if self.state == 1:
+                chunk = self.file.read(size)
+                if not chunk:
+                    self.file.close()
+                    self.state = 2
+                    return self.read(size)
+                return chunk
+            if self.state == 2:
+                self.state = 3
+                return self.suffix
+            return b""
+
+    stream = MultipartFileStream(prefix, file_path, suffix)
+    content_length = len(prefix) + file_path.stat().st_size + len(suffix)
+
     req = urllib.request.Request(
         endpoint,
-        data=b"".join(chunks),
-        headers={**headers, "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        data=stream,
+        headers={
+            **headers,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(content_length),
+        },
         method="POST",
     )
     return _read_json_response(req, timeout=timeout)

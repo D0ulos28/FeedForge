@@ -82,7 +82,10 @@ def create_app(
         job_dir.mkdir(parents=True, exist_ok=True)
         suffix = Path(file.filename or "song.wav").suffix or ".wav"
         input_path = uploads_dir / f"{job_id}{suffix}"
-        input_path.write_bytes(await file.read())
+
+        # Stream the uploaded file directly to disk to minimize memory consumption
+        with input_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
         try:
             async with separation_slots:
@@ -180,6 +183,10 @@ def run_demucs(
         raise RuntimeError(f"Demucs runtime dependencies are missing: {exc}") from exc
 
     resolved_device = resolve_device(device)
+    # Limit maximum PyTorch threads on CPU to prevent resource contention and thread thrashing
+    if resolved_device == "cpu":
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+
     demucs_model = load_demucs_model(model, device=resolved_device)
     data, samplerate = sf.read(input_path, always_2d=True, dtype="float32")
     wav = torch.from_numpy(data.T)

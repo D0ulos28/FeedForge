@@ -37,6 +37,13 @@ def create_app(
     root = Path(storage_dir or Path(tempfile.gettempdir()) / "feedforge-demucs-server")
     uploads_dir = root / "uploads"
     jobs_dir = root / "jobs"
+
+    # Clean up orphan uploads and jobs from previous runs on startup
+    if uploads_dir.is_dir():
+        shutil.rmtree(uploads_dir, ignore_errors=True)
+    if jobs_dir.is_dir():
+        shutil.rmtree(jobs_dir, ignore_errors=True)
+
     uploads_dir.mkdir(parents=True, exist_ok=True)
     jobs_dir.mkdir(parents=True, exist_ok=True)
     separation_slots = asyncio.Semaphore(normalize_concurrency(concurrency))
@@ -193,9 +200,13 @@ def run_demucs(
     for stem in stems:
         if stem not in source_names:
             continue
-        target = job_dir / f"{stem}.wav"
+        target = job_dir / f"{stem}.ogg"
         stem_audio = separated[source_names.index(stem)].clamp(-1, 1).cpu().numpy().T
-        sf.write(target, stem_audio, demucs_model.samplerate, subtype="PCM_16")
+        try:
+            sf.write(target, stem_audio, demucs_model.samplerate, format="OGG", subtype="VORBIS")
+        except Exception:
+            target = job_dir / f"{stem}.wav"
+            sf.write(target, stem_audio, demucs_model.samplerate, subtype="PCM_16")
         produced[stem] = target
 
     if not produced:

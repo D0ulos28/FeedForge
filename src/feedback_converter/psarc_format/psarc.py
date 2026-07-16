@@ -1,6 +1,8 @@
+import os
 import zlib
 from hashlib import md5
 from io import BytesIO
+from pathlib import Path
 
 from construct import (
     Adapter,
@@ -125,15 +127,16 @@ def create_bom(entries):
 
 
 class LazyPSARCContent(Mapping):
-    def __init__(self, stream, header, end_offsets, crypto):
-        self.stream = stream
+    def __init__(self, filepath, header, end_offsets, crypto):
+        self.filepath = Path(filepath)
         self.header = header
         self.end_offsets = end_offsets
         self.crypto = crypto
         self._cache = {}
 
         # Parse listing entry (BOM index 0)
-        listing_data = read_entry(self.stream, 0, self.header.bom, self.end_offsets[0])
+        with self.filepath.open("rb") as f:
+            listing_data = read_entry(f, 0, self.header.bom, self.end_offsets[0])
         self.listing = listing_data.decode().splitlines()
         self._mapping = {name: i + 1 for i, name in enumerate(self.listing)}
 
@@ -150,7 +153,8 @@ class LazyPSARCContent(Mapping):
             return self._cache[key]
 
         index = self._mapping[key]
-        data = read_entry(self.stream, index, self.header.bom, self.end_offsets[index])
+        with self.filepath.open("rb") as f:
+            data = read_entry(f, index, self.header.bom, self.end_offsets[index])
         if self.crypto:
             normalized = key.replace("\\", "/").lower()
             if "songs/bin/macos/" in normalized:
@@ -176,7 +180,23 @@ class PSARC(Construct):
         file_size = stream.tell()
         offsets = [entry.offset for entry in header.bom.entries]
         end_offsets = offsets[1:] + [file_size]
-        return LazyPSARCContent(stream, header, end_offsets, self.crypto)
+
+        # Check if it's a file stream on disk to support lazy loading
+        filepath = getattr(stream, "name", None)
+        if filepath and os.path.exists(filepath):
+            return LazyPSARCContent(filepath, header, end_offsets, self.crypto)
+        else:
+            # Fallback to non-lazy dict if it's an in-memory BytesIO
+            listing_data = read_entry(stream, 0, header.bom, end_offsets[0])
+            listing = listing_data.decode().splitlines()
+            entries = [
+                read_entry(stream, i + 1, header.bom, end_offsets[i + 1])
+                for i in range(header.n_entries - 1)
+            ]
+            content = dict(zip(listing, entries))
+            if self.crypto:
+                content = decrypt_psarc(content)
+            return content
 
     def _build(self, content, stream, context, path):
         if self.crypto:

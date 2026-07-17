@@ -2417,14 +2417,14 @@ def _convert_wem_with_vgmstream(data: bytes, output_path: Path, tools_dir: Path)
 
 
 def _convert_wav_file_to_ogg(input_path: Path, output_path: Path) -> bool:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.unlink(missing_ok=True)
     try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        # Read the WAV file using soundfile
-        audio_data, samplerate = sf.read(input_path)
-        # Write OGG directly using soundfile
+        audio_data, samplerate = sf.read(input_path, dtype="float32")
         sf.write(output_path, audio_data, samplerate, format="OGG", subtype="VORBIS")
-        return True
+        return output_path.stat().st_size > 4 and output_path.read_bytes().startswith(b"OggS")
     except Exception:
+        output_path.unlink(missing_ok=True)
         return False
 
 
@@ -2460,13 +2460,14 @@ def _copy_cover(content: dict[str, bytes], package_dir: Path) -> str | None:
 
 
 def _convert_dds_bytes_to_png(data: bytes, output_path: Path) -> bool:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.unlink(missing_ok=True)
     try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        # Convert DDS to PNG natively using PIL
-        with Image.open(io.BytesIO(data)) as img:
-            img.save(output_path, "PNG")
-        return True
+        with Image.open(io.BytesIO(data)) as image:
+            image.save(output_path, "PNG")
+        return output_path.stat().st_size > 8 and output_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     except Exception:
+        output_path.unlink(missing_ok=True)
         return False
 
 

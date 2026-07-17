@@ -4,7 +4,7 @@
 
 FeedForge is a cross-platform desktop tool (supporting Windows, Linux, and macOS) for converting `.psarc` CDLC packages into `.feedpak` packages for FeedBack.
 
-It can convert one file or a full folder of CDLC files in a batch. During import it reads song metadata, cover art, arrangements, lyrics, and duration so the files can be checked before export.
+It can convert one file or a full folder of CDLC files in a batch. During import it reads song metadata, cover art, arrangements, lyrics, and duration so the files can be checked before export. It also opens existing `.feedpak` packages so metadata, cover art, stems, and package details can be reviewed or updated without reconverting from source.
 
 ## Download & Execution
 
@@ -58,6 +58,8 @@ FeedForge includes several features to handle large song libraries safely:
 - **PyTorch Thread Bounds**: Stem separation concurrency is automatically limited to prevent core thrashing on CPU runs.
 - **UI Error Boundary**: Component rendering exceptions in the Electron frontend are caught by a global React boundary, preventing blank window screens and providing a crash log report with a reload option.
 
+FeedForge checks GitHub releases for newer versions from inside the app.
+
 ## Community
 
 Join the FeedForge Discord server for announcements, support, bug reports, and feature requests:
@@ -76,6 +78,25 @@ https://discord.gg/9cUe6cacQN
 8. Click `Convert queue`.
 
 The app writes `.feedpak` files that can be added to FeedBack.
+
+## FeedPak tools
+
+FeedForge can open existing `.feedpak` files to inspect package contents, song
+metadata, cover art, arrangements, stems, and tones. Metadata and cover art can
+be edited and saved back into the package.
+
+Existing FeedPaks can also be sent through stem separation without converting a
+`.psarc` again.
+
+## Stem splitting
+
+Stem splitting can run locally after FeedForge installs a local Demucs
+environment and downloads the selected model. A custom or remote Demucs server
+URL can also be used.
+
+The selected model is downloaded once and reused from the chosen stem server
+folder. Users can choose which separated stems to include, and FeedForge keeps
+the full mix in `stems/full.ogg` for FeedBack compatibility.
 
 ## Notes
 

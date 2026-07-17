@@ -43,3 +43,8 @@ outputs/
 references/
 coverage/
 *.log
+Tmp/
+
+# Internal maintenance and validation files
+tools/backfill_feedpak_authors.py
+tools/__pycache__/

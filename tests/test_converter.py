@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -354,6 +355,33 @@ def test_extract_metadata_reads_toolkit_package_author():
     assert metadata["authors"] == [{"name": "nicolobos77", "role": "charter"}]
 
 
+def test_extract_metadata_reads_inline_toolkit_package_author():
+    metadata = converter._extract_metadata(
+        {
+            "manifests/songs_dlc/test/test.json": json.dumps(
+                {"SongName": "Song", "ArtistName": "Artist"}
+            ).encode(),
+            "toolkit.version": (
+                b"Toolkit version: 2.9.2.1 Package Author: RealCharter Package Version: 2"
+            ),
+        }
+    )
+
+    assert metadata["authors"] == [{"name": "RealCharter", "role": "charter"}]
+
+
+def test_extract_metadata_ignores_punctuation_only_author():
+    metadata = converter._extract_metadata(
+        {
+            "manifests/songs_dlc/test/test.json": json.dumps(
+                {"SongName": "Song", "ArtistName": "Artist", "PackageAuthor": "!!!"}
+            ).encode(),
+        }
+    )
+
+    assert metadata["authors"] == []
+
+
 def test_extract_metadata_ignores_generic_toolkit_package_author():
     metadata = converter._extract_metadata(
         {
@@ -685,6 +713,27 @@ def test_single_cli_explicit_output_file_is_preserved(tmp_path):
     output_file = tmp_path / "custom.feedpak"
 
     assert _single_output_path(input_path, output_file) == output_file
+
+
+def test_cli_inspect_json_handles_non_ascii_on_legacy_console(monkeypatch):
+    class LegacyConsole:
+        encoding = "ascii"
+
+        def __init__(self):
+            self.buffer = io.BytesIO()
+
+        def write(self, value):
+            value.encode(self.encoding)
+
+        def flush(self):
+            pass
+
+    stdout = LegacyConsole()
+    monkeypatch.setattr(cli.sys, "stdout", stdout)
+    monkeypatch.setattr(cli, "inspect_psarc", lambda *_args, **_kwargs: {"title": "Beyoncé"})
+
+    assert cli.main(["--inspect-json", "sample.psarc"]) == 0
+    assert b'"title": "Beyonc\\xe9"' in stdout.buffer.getvalue()
 
 
 def test_batch_output_layout_preserves_source_folders(tmp_path):

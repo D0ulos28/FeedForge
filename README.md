@@ -2,18 +2,114 @@
 
 ![FeedForge icon](assets/feedforge.png)
 
-FeedForge is a Windows tool for converting `.psarc` CDLC packages into
-`.feedpak` packages for FeedBack.
+FeedForge is a cross-platform desktop toolkit for converting Rocksmith `.psarc`
+CDLC into FeedBack `.feedpak` packages and inspecting or editing existing
+FeedPaks.
 
-It can convert one file or a full folder of CDLC files in a batch. It also opens
-existing `.feedpak` packages so metadata, cover art, stems, and package details
-can be reviewed or updated without reconverting from source.
+## Platform support
+
+| Platform | Run from source | Desktop package | WEM decoding |
+| --- | --- | --- | --- |
+| Windows | Supported | Portable EXE | Codec tools bundled by release CI |
+| Linux | Supported | AppImage | Install `vgmstream-cli` on `PATH` |
+| macOS | Supported | DMG | Install `vgmstream-cli` on `PATH` |
+
+macOS packages are currently unsigned, so Gatekeeper may require manual
+approval. The application, converter, and Python stem launcher use the same
+code on every platform; only optional native codec executables differ.
 
 ## Download
 
-Download the portable EXE from the latest GitHub release.
+Download the package for your operating system from the latest GitHub release.
+FeedForge also checks GitHub releases for newer versions from inside the app.
 
-FeedForge checks GitHub releases for newer versions from inside the app.
+## Features
+
+- Convert individual PSARCs or recursively imported folders.
+- Inspect metadata, cover art, arrangements, lyrics, tones, and duration.
+- Open and edit existing FeedPaks, including metadata, authors, cover art, and
+  stem separation.
+- Customize batch output layouts and filenames.
+- Inspect tone timelines and mapped equipment assets.
+- Split stems through the local Demucs setup or a compatible remote server.
+- Convert DDS images with Pillow and WAV audio with `soundfile` on every OS.
+
+## Install from source
+
+Requirements:
+
+- Python 3.11 or newer
+- Node.js 20 or newer
+- `vgmstream-cli` available on `PATH` on Linux/macOS for WEM decoding
+
+```bash
+git clone https://github.com/balki97/FeedForge.git
+cd FeedForge
+python -m venv .venv
+```
+
+Activate the environment:
+
+```bash
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+# Linux/macOS
+source .venv/bin/activate
+```
+
+Install and run:
+
+```bash
+python -m pip install -e ".[dev]"
+npm ci
+npm run dev
+```
+
+## Build
+
+Build the converter and desktop package for the current operating system:
+
+```bash
+npm run release
+```
+
+Platform-specific desktop commands are also available:
+
+```bash
+npm run electron:pack:win
+npm run electron:pack:linux
+npm run electron:pack:mac
+```
+
+PyInstaller includes native codec tools when they are present in
+`src/feedback_converter/tools`; otherwise the converter searches `PATH`.
+
+## Test
+
+```bash
+python -m pytest -q
+npm test
+npm run build
+```
+
+## Stem splitting
+
+The local stem setup uses `tools/start-demucs-server.py` on every platform. It
+creates an isolated environment under the selected Demucs folder, installs the
+stem dependencies, reuses downloaded models, and starts the service at
+`http://127.0.0.1:7865`.
+
+A compatible remote Demucs server can be used instead. FeedForge retains the
+full mix in `stems/full.ogg` when separated stems are added.
+
+## Diagnostics
+
+Debug logs are stored in Electron's platform-specific user-data directory:
+
+- Windows: `%APPDATA%\FeedForge\logs\feedforge-debug.log`
+- Linux: `~/.config/FeedForge/logs/feedforge-debug.log`
+- macOS: `~/Library/Application Support/FeedForge/logs/feedforge-debug.log`
 
 ## Community
 
@@ -21,46 +117,3 @@ Join the FeedForge Discord server for announcements, support, bug reports, and
 feature requests:
 
 https://discord.gg/9cUe6cacQN
-
-## Usage
-
-1. Open FeedForge.
-2. Add `.psarc` files by browsing, dragging them in, or choosing a folder.
-3. Choose an output folder.
-4. Choose an output layout: one folder, preserve source folders, or artist folders.
-5. Choose output file names: source filename, artist-song, song-artist, or a custom template.
-6. Select the number of conversion workers.
-7. Optional: enable stem separation or B-standard remapping.
-8. Click `Convert queue`.
-
-The app writes `.feedpak` files that can be added to FeedBack.
-
-## FeedPak tools
-
-FeedForge can open existing `.feedpak` files to inspect package contents, song
-metadata, cover art, arrangements, stems, and tones. Metadata and cover art can
-be edited and saved back into the package.
-
-Existing FeedPaks can also be sent through stem separation without converting a
-`.psarc` again.
-
-## Stem splitting
-
-Stem splitting can run locally after FeedForge installs a local Demucs
-environment and downloads the selected model. A custom or remote Demucs server
-URL can also be used.
-
-The selected model is downloaded once and reused from the chosen stem server
-folder. Users can choose which separated stems to include, and FeedForge keeps
-the full mix in `stems/full.ogg` for FeedBack compatibility.
-
-## Notes
-
-- Use fewer workers if the PC becomes slow during a large batch.
-- `Stop after current` pauses the queue after active conversions finish.
-- Existing output files are skipped unless `Overwrite` is enabled.
-- The local stem server install folder stores its Python environment, cache, and
-  downloaded Demucs models. Choose a folder on a drive with enough free space.
-- Very large libraries are supported through folder import and a limited queue view.
-- If a conversion fails, send `%APPDATA%\FeedForge\logs\feedforge-debug.log`
-  with the bug report.

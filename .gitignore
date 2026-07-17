@@ -46,7 +46,8 @@ coverage/
 Tmp/
 
 # Internal maintenance and validation files
-tests/
+tests/*
+!tests/test_portability.py
 tools/backfill_feedpak_authors.py
 tools/reconvert_dlc_parallel.py
 tools/__pycache__/

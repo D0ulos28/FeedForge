@@ -3,62 +3,88 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    name: Build and Release Windows EXE
-    runs-on: windows-latest
-    permissions:
-      contents: write
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            artifact: windows
+          - name: Linux
+            os: ubuntu-latest
+            artifact: linux
+          - name: macOS
+            os: macos-latest
+            artifact: macos
+    runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          cache: 'pip'
+          python-version: "3.12"
+          cache: pip
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "20"
+          cache: npm
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install .[dev]
+          python -m pip install ".[dev]"
+          npm ci
 
-      - name: Install Node.js dependencies
-        run: npm ci
-
-      - name: Download missing CLI tools
-        shell: powershell
+      - name: Download bundled Windows codec tools
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path src\feedback_converter\tools
-          
-          # Download and extract ww2ogg
+          New-Item -ItemType Directory -Force -Path src/feedback_converter/tools
           Invoke-WebRequest -Uri "https://hcs64.com/files/ww2ogg04.zip" -OutFile "ww2ogg.zip"
           Expand-Archive -Path "ww2ogg.zip" -DestinationPath "ww2ogg_extracted" -Force
-          Copy-Item -Path "ww2ogg_extracted\ww2ogg.exe" -Destination "src\feedback_converter\tools\ww2ogg.exe" -Force
-          
-          # Download and extract vgmstream
+          Copy-Item "ww2ogg_extracted/ww2ogg.exe" "src/feedback_converter/tools/ww2ogg.exe" -Force
           Invoke-WebRequest -Uri "https://github.com/vgmstream/vgmstream/releases/latest/download/vgmstream-win.zip" -OutFile "vgmstream.zip"
           Expand-Archive -Path "vgmstream.zip" -DestinationPath "vgmstream_extracted" -Force
-          Copy-Item -Path "vgmstream_extracted\vgmstream-cli.exe" -Destination "src\feedback_converter\tools\vgmstream-cli.exe" -Force
-          Copy-Item -Path "vgmstream_extracted\*.dll" -Destination "src\feedback_converter\tools\" -Force
+          Copy-Item "vgmstream_extracted/vgmstream-cli.exe" "src/feedback_converter/tools/vgmstream-cli.exe" -Force
+          Copy-Item "vgmstream_extracted/*.dll" "src/feedback_converter/tools/" -Force
 
-      - name: Build and Package App
+      - name: Test
+        run: |
+          python -m pytest -q
+          npm test
+          npm run build
+
+      - name: Build packages
         run: npm run release
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release/*.exe
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feedforge-${{ matrix.artifact }}
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

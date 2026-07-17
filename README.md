@@ -2,115 +2,144 @@
 
 ![FeedForge icon](assets/feedforge.png)
 
-FeedForge is a cross-platform desktop tool (supporting Windows, Linux, and macOS) for converting `.psarc` CDLC packages into `.feedpak` packages for FeedBack.
+FeedForge is a cross-platform desktop toolkit for converting Rocksmith `.psarc`
+CDLC into FeedBack `.feedpak` packages and inspecting or editing existing
+FeedPaks. This repository tracks the features and fixes from the original
+[FeedForge project](https://github.com/balki97/FeedForge) while maintaining a
+shared Windows, Linux, and macOS codebase.
 
-It can convert one file or a full folder of CDLC files in a batch. During import it reads song metadata, cover art, arrangements, lyrics, and duration so the files can be checked before export. It also opens existing `.feedpak` packages so metadata, cover art, stems, and package details can be reviewed or updated without reconverting from source.
+## Platform support
 
-## Download & Execution
+| Platform | Run from source | Desktop package | WEM decoding |
+| --- | --- | --- | --- |
+| Windows | Supported | Portable EXE | Codec tools bundled by release CI |
+| Linux | Supported | AppImage | Install `vgmstream-cli` on `PATH` |
+| macOS | Supported | DMG | Install `vgmstream-cli` on `PATH` |
 
-- **Windows (Pre-built)**: Download the portable EXE from the [Releases](https://github.com/D0ulos28/FeedForge/releases) page.
-- **Running from Source (All Platforms)**:
-  1. Clone the repository:
-     ```bash
-     git clone https://github.com/D0ulos28/FeedForge.git
-     cd FeedForge
-     ```
-  2. Install Python dependencies:
-     ```bash
-     pip install -e .
-     ```
-  3. Install Node.js dependencies:
-     ```bash
-     npm install
-     ```
-  4. Run in development mode:
-     ```bash
-     npm run dev
-     ```
+macOS packages are currently unsigned, so Gatekeeper may require manual
+approval. Linux and macOS use the same application, converter, and Python stem
+launcher as Windows; only optional native codec executables differ by platform.
 
-## Building from Source
+## Features
 
-To build a standalone packaged version of the application:
-- **Python Backend**: Pack the CLI tool into a standalone binary using PyInstaller:
-  ```bash
-  npm run converter:pack
-  ```
-- **Electron Frontend**: Package the Electron app (runs `electron-builder`):
-  ```bash
-  # Packages for Windows
-  npm run electron:pack
-  # Or build everything
-  npm run release
-  ```
+- Convert individual PSARCs or recursively imported folders.
+- Inspect metadata, cover art, arrangements, lyrics, tones, and duration before
+  conversion.
+- Open and edit existing FeedPaks, including metadata, authors, cover art, and
+  stem separation.
+- Preserve or customize batch output layouts and filenames.
+- Inspect tone timelines and mapped equipment assets.
+- Split stems through the unified local Demucs setup or a compatible remote
+  server.
+- Stream large uploads and lazily read PSARC contents to reduce memory use.
+- Convert DDS images with Pillow and WAV audio with `soundfile` on every OS.
 
-## Platform Dependencies
+## Install from source
 
-FeedForge is fully cross-platform and uses:
-- **Pillow**: For pure-Python DDS-to-PNG cover art conversion.
-- **soundfile**: For pure-Python WAV-to-OGG Vorbis encoding.
-- **vgmstream-cli** & **ww2ogg**: For Wwise WEM audio decoding. These are resolved dynamically based on the OS. On non-Windows platforms (Linux/macOS), they must be installed globally on your machine and available in your system `PATH`.
+Requirements:
 
-## Optimizations & Resiliency
+- Python 3.11 or newer
+- Node.js 20 or newer
+- `vgmstream-cli` available on `PATH` on Linux/macOS for WEM audio decoding
 
-FeedForge includes several features to handle large song libraries safely:
-- **Lazy PSARC Reading**: CDLC packages are parsed and decompressed on demand, preventing RAM spikes when processing large directories.
-- **Audio Streaming**: Multipart uploads and stems are streamed chunk-by-chunk to disk instead of being loaded entirely into memory.
-- **PyTorch Thread Bounds**: Stem separation concurrency is automatically limited to prevent core thrashing on CPU runs.
-- **UI Error Boundary**: Component rendering exceptions in the Electron frontend are caught by a global React boundary, preventing blank window screens and providing a crash log report with a reload option.
+```bash
+git clone https://github.com/D0ulos28/FeedForge.git
+cd FeedForge
+python -m venv .venv
+```
 
-FeedForge checks GitHub releases for newer versions from inside the app.
+Activate the environment:
 
-## Community
+```bash
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
 
-Join the FeedForge Discord server for announcements, support, bug reports, and feature requests:
+# Linux/macOS
+source .venv/bin/activate
+```
 
-https://discord.gg/9cUe6cacQN
+Install and run:
 
-## Usage
+```bash
+python -m pip install -e ".[dev]"
+npm ci
+npm run dev
+```
 
-1. Open FeedForge.
-2. Add `.psarc` files by browsing, dragging them in, or choosing a folder.
-3. Choose an output folder.
-4. Choose an output layout: one folder, preserve source folders, or artist folders.
-5. Choose output file names: source filename, artist-song, song-artist, or a custom template.
-6. Select the number of conversion workers.
-7. Optional: enable stem separation or B-standard remapping.
-8. Click `Convert queue`.
+## Build
 
-The app writes `.feedpak` files that can be added to FeedBack.
+Build the converter and a desktop package for the current operating system:
 
-## FeedPak tools
+```bash
+npm run release
+```
 
-FeedForge can open existing `.feedpak` files to inspect package contents, song
-metadata, cover art, arrangements, stems, and tones. Metadata and cover art can
-be edited and saved back into the package.
+Platform-specific desktop commands are also available:
 
-Existing FeedPaks can also be sent through stem separation without converting a
-`.psarc` again.
+```bash
+npm run electron:pack:win
+npm run electron:pack:linux
+npm run electron:pack:mac
+```
+
+PyInstaller includes native codec tools when they are present in
+`src/feedback_converter/tools`; otherwise the converter searches `PATH`.
+Release CI supplies the existing Windows codec bundle and produces Windows,
+Linux, and macOS artifacts through one build definition.
+
+## Test
+
+```bash
+python -m pytest -q
+npm test
+npm run build
+```
 
 ## Stem splitting
 
-Stem splitting can run locally after FeedForge installs a local Demucs
-environment and downloads the selected model. A custom or remote Demucs server
-URL can also be used.
+The in-app local stem setup uses `tools/start-demucs-server.py` on every
+platform. It creates an isolated environment under the selected Demucs folder,
+installs the `stems` dependencies, reuses downloaded models, and starts the
+local service at `http://127.0.0.1:7865`.
 
-The selected model is downloaded once and reused from the chosen stem server
-folder. Users can choose which separated stems to include, and FeedForge keeps
-the full mix in `stems/full.ogg` for FeedBack compatibility.
+A compatible remote Demucs server can be used instead. FeedForge retains the
+full mix in `stems/full.ogg` when separated stems are added.
 
-## Notes
+## Keeping current with upstream
 
-- Use fewer workers if the PC becomes slow during a large batch.
-- `Stop after current` pauses the queue after active conversions finish.
-- Existing output files are skipped unless `Overwrite` is enabled.
-- Stem separation can use the in-app `Install/start local stem server` button, FeedBack's Demucs server setting, or a custom Demucs server URL.
-- The local stem server install folder stores its Python environment, cache, and downloaded Demucs models. Choose a folder on a drive with enough free space.
-- Already downloaded Demucs models are detected in the selected install folder and reused on later starts.
-- Very large libraries are supported through folder import and a limited queue view.
-- If a conversion fails, send the debug log with your bug report. The log is located at:
-  - **Windows**: `%APPDATA%\FeedForge\logs\feedforge-debug.log`
-  - **Linux / macOS**: `~/.config/FeedForge/logs/feedforge-debug.log`
+The recommended Git remotes are:
 
----
+```bash
+git remote add upstream https://github.com/balki97/FeedForge.git
+git fetch upstream
+git merge upstream/main
+```
 
-*Note: This repository is a fork of the original [FeedForge](https://github.com/balki97/FeedForge) project by [balki97](https://github.com/balki97). The cross-platform refactoring, memory/IO footprint optimizations, and PyTorch concurrency tuning in this version were implemented with assistance from Google Antigravity (AI).*
+Upstream feature merges should be kept separate from portability commits. This
+makes platform changes easy to review, test, and propose back to the original
+project without fork-specific merge noise.
+
+## Diagnostics
+
+Debug logs are stored in Electron's platform-specific user-data directory:
+
+- Windows: `%APPDATA%\FeedForge\logs\feedforge-debug.log`
+- Linux: `~/.config/FeedForge/logs/feedforge-debug.log`
+- macOS: `~/Library/Application Support/FeedForge/logs/feedforge-debug.log`
+
+## Community
+
+Join the original FeedForge Discord server for announcements, support, bug
+reports, and feature requests:
+
+https://discord.gg/9cUe6cacQN
+
+## Credits
+
+FeedForge was created by [balki97](https://github.com/balki97) and is developed
+in the original [balki97/FeedForge](https://github.com/balki97/FeedForge)
+repository. This fork preserves that attribution and community information.
+
+The cross-platform conversion refactor, memory and I/O optimizations, PyTorch
+concurrency tuning, and subsequent integration work in this fork were developed
+with AI assistance, including Google Antigravity and OpenAI Codex.

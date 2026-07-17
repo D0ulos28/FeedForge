@@ -1,33 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 
+project_root = Path(SPECPATH)
+tools_dir = project_root / "src" / "feedback_converter" / "tools"
+data_dir = project_root / "src" / "feedback_converter" / "data"
+
+# Native codec tools are optional and platform-specific. Include whichever
+# binaries the build job supplied; runtime code also searches PATH.
+binary_paths = [
+    tools_dir / "ww2ogg.exe",
+    tools_dir / "vgmstream-cli.exe",
+    *tools_dir.glob("*.dll"),
+]
+binaries = [(str(item), "feedback_converter/tools") for item in binary_paths if item.is_file()]
+datas = [
+    (str(tools_dir / "packed_codebooks.bin"), "feedback_converter/tools"),
+    (str(tools_dir / "packed_codebooks_aoTuV_603.bin"), "feedback_converter/tools"),
+    (str(data_dir / "equipment.json"), "feedback_converter/data"),
+    (str(data_dir / "feedback_equipment.json"), "feedback_converter/data"),
+]
 
 a = Analysis(
-    ['src\\feedback_converter\\cli.py'],
-    pathex=[],
-    binaries=[
-        ('src\\feedback_converter\\tools\\ww2ogg.exe', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\vgmstream-cli.exe', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\avcodec-vgmstream-59.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\avformat-vgmstream-59.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\avutil-vgmstream-57.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\swresample-vgmstream-4.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\libatrac9.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\libcelt-0061.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\libcelt-0110.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\libg719_decode.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\libmpg123-0.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\libspeex-1.dll', 'feedback_converter\\tools'),
-        ('src\\feedback_converter\\tools\\libvorbis.dll', 'feedback_converter\\tools'),
-    ],
-    datas=[
-        ('src\\feedback_converter\\tools\\packed_codebooks.bin', 'feedback_converter\\tools'),
-        (
-            'src\\feedback_converter\\tools\\packed_codebooks_aoTuV_603.bin',
-            'feedback_converter\\tools',
-        ),
-        ('src\\feedback_converter\\data\\equipment.json', 'feedback_converter\\data'),
-        ('src\\feedback_converter\\data\\feedback_equipment.json', 'feedback_converter\\data'),
-    ],
+    [str(project_root / "src" / "feedback_converter" / "cli.py")],
+    pathex=[str(project_root / "src")],
+    binaries=binaries,
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -43,7 +40,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='psarc2feedpak',
+    name="psarc2feedpak",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -64,5 +61,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='psarc2feedpak',
+    name="psarc2feedpak",
 )

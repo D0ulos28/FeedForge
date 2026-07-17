@@ -82,6 +82,7 @@ function App() {
   const [settingsSection, setSettingsSection] = useState("conversion");
   const [isConverting, setIsConverting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
+  const [conversionProgress, setConversionProgress] = useState({ total: 0, completed: 0, failed: 0, active: [], stopped: false });
   const itemsRef = useRef(items);
   const inspectionQueueRef = useRef([]);
   const activeInspectionsRef = useRef(0);
@@ -461,11 +462,6 @@ function App() {
 
   async function convertQueue() {
     if (!items.length || isConverting) return;
-    isConvertingRef.current = true;
-    stopRequestedRef.current = false;
-    setIsStopping(false);
-    setIsConverting(true);
-    const stopManagedStemServerAfterQueue = separateStems && stemServerStatus.processRunning;
     const pending = [];
     const pendingPaths = new Set();
     for (const item of itemsRef.current) {
@@ -475,6 +471,13 @@ function App() {
       pendingPaths.add(key);
       pending.push(item);
     }
+    if (!pending.length) return;
+    isConvertingRef.current = true;
+    stopRequestedRef.current = false;
+    setIsStopping(false);
+    setIsConverting(true);
+    setConversionProgress({ total: pending.length, completed: 0, failed: 0, active: [], stopped: false });
+    const stopManagedStemServerAfterQueue = separateStems && stemServerStatus.processRunning;
     const batchSourceRoot = commonAncestorDir(pending.map((item) => item.path));
     let index = 0;
 
@@ -484,6 +487,10 @@ function App() {
       index += 1;
       if (!item) return;
       updateItem(item.id, { status: "converting", error: null });
+      setConversionProgress((current) => ({
+        ...current,
+        active: [...current.active.filter((entry) => entry.id !== item.id), { id: item.id, name: item.preview?.title || item.name, artist: item.preview?.artist || "" }]
+      }));
       const outputPath = outputDir ? outputPathForItem(item, outputDir, outputLayout, item.sourceRoot || batchSourceRoot, outputNameFormat, outputNameTemplate) : null;
       const payload = {
         inputPath: item.path,
@@ -495,18 +502,32 @@ function App() {
         demucsModel,
         demucsStems
       };
-      const result = item.sourceType === "feedpak"
-        ? await api.updateFeedpak(payload)
-        : await api.convert({ ...payload, bStandardTo7String });
-      if (!result.ok) {
-        updateItem(item.id, { status: "failed", error: result.error });
-      } else {
-        const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
-        updateItem(item.id, {
-          status: "converted",
-          outputPath: result.outputPath || outputPath,
-          error: warnings.length ? warnings.join("\n") : null
-        });
+      let failed = false;
+      try {
+        const result = item.sourceType === "feedpak"
+          ? await api.updateFeedpak(payload)
+          : await api.convert({ ...payload, bStandardTo7String });
+        if (!result.ok) {
+          failed = true;
+          updateItem(item.id, { status: "failed", error: result.error });
+        } else {
+          const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
+          updateItem(item.id, {
+            status: "converted",
+            outputPath: result.outputPath || outputPath,
+            error: warnings.length ? warnings.join("\n") : null
+          });
+        }
+      } catch (error) {
+        failed = true;
+        updateItem(item.id, { status: "failed", error: error?.message || "Conversion failed." });
+      } finally {
+        setConversionProgress((current) => ({
+          ...current,
+          completed: Math.min(current.total, current.completed + 1),
+          failed: current.failed + (failed ? 1 : 0),
+          active: current.active.filter((entry) => entry.id !== item.id)
+        }));
       }
       if (stopRequestedRef.current) return;
       await convertNext();
@@ -516,10 +537,12 @@ function App() {
       const workerCount = Math.min(Math.max(1, conversionWorkers), pending.length);
       await Promise.all(Array.from({ length: workerCount }, () => convertNext()));
     } finally {
+      const stopped = stopRequestedRef.current;
       isConvertingRef.current = false;
       stopRequestedRef.current = false;
       setIsStopping(false);
       setIsConverting(false);
+      setConversionProgress((current) => ({ ...current, active: [], stopped }));
       if (stopManagedStemServerAfterQueue) {
         stopLocalStemServer();
       }
@@ -530,6 +553,7 @@ function App() {
   function stopConversion() {
     stopRequestedRef.current = true;
     setIsStopping(true);
+    setConversionProgress((current) => ({ ...current, stopped: true }));
   }
 
   async function saveFeedpakMetadata(item, metadata, authors, options = {}) {
@@ -680,6 +704,10 @@ function App() {
               Open GitHub
             </button>
           </section>
+        )}
+
+        {conversionProgress.total > 0 && (
+          <ConversionProgress progress={conversionProgress} isConverting={isConverting} />
         )}
 
         <section className="view-tabs app-tabs" aria-label="FeedForge sections">
@@ -1234,6 +1262,56 @@ function Metric({ label, value, tone = "" }) {
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+function ConversionProgress({ progress, isConverting }) {
+  const total = Math.max(0, progress.total || 0);
+  const completed = Math.min(total, Math.max(0, progress.completed || 0));
+  const failed = Math.max(0, progress.failed || 0);
+  const remaining = Math.max(0, total - completed);
+  const percent = total ? Math.round((completed / total) * 100) : 0;
+  const status = progress.stopped
+    ? "Stopped"
+    : isConverting
+      ? "Converting"
+      : completed >= total
+        ? "Complete"
+        : "Waiting";
+
+  return (
+    <section className={`conversion-progress ${isConverting ? "active" : progress.stopped ? "stopped" : "complete"}`}>
+      <div className="conversion-progress-head">
+        <div>
+          <strong>{status}</strong>
+          <span>
+            {completed} of {total} processed
+            {remaining ? `, ${remaining} remaining` : ""}
+            {failed ? `, ${failed} failed` : ""}
+          </span>
+        </div>
+        <b>{percent}%</b>
+      </div>
+      <div className="progress-track conversion-progress-track" aria-label={`Conversion progress ${percent}%`}>
+        <span style={{ width: `${Math.max(2, percent)}%` }} />
+      </div>
+      {progress.active?.length > 0 && (
+        <div className="active-conversions">
+          {progress.active.map((item) => (
+            <div className="active-conversion-row" key={item.id}>
+              <RotateCw className="spin" size={15} />
+              <div>
+                <strong>{item.name}</strong>
+                {item.artist && <span>{item.artist}</span>}
+              </div>
+              <div className="active-file-track" aria-hidden="true">
+                <span />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
